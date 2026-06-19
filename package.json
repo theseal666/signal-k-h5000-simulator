@@ -1,0 +1,12 @@
+{
+  "name": "signal-k-h5000-simulator",
+  "version": "1.0.0",
+  "description": "B&G H5000 simulator and derived wind vector math processor for Signal K",
+  "main": "index.js",
+  "keywords": [
+    "signalk-node-server-plugin"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {}
+}
