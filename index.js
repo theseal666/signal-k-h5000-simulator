@@ -8,10 +8,11 @@ module.exports = function (app) {
 
   plugin.id = 'signal-k-h5000-simulator';
   plugin.name = 'B&G H5000 Network Simulator (UDP Sentences)';
-  plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 mapped to dynamically fetched ORC polar targets.';
+  plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 with configurable maneuver intervals, dynamic rudder updates, and stepped performance tracking.';
 
   let simStep = 0;
   let orcTargetSTW = 7.80; // Knots baseline fallback
+  let randomVarianceScalar = 0.95; // Initial performance scalar match
 
   plugin.start = function (startOptions) {
     options = startOptions || {};
@@ -32,7 +33,6 @@ module.exports = function (app) {
   };
 
   async function fetchOrcPolarMatrix(certId) {
-    // Reconstruct into a valid machine-readable parameter string endpoint
     const url = `https://data.orc.org/public/WPub.dll?cmd=viewjson&id=${certId.trim()}`;
     try {
       app.debug(`Simulator querying ORC data payload line: ${url}`);
@@ -45,11 +45,9 @@ module.exports = function (app) {
       if (!response.ok) throw new Error(`HTTP Error ${response.status}`);
       const data = await response.json();
       
-      // Parse the structured VPP schema response directly out of the certificate data blocks
       if (data && data.vpp) {
         options.polarData = data.vpp;
-        app.debug(`Successfully parsed ORC matrix for boat: ${data.name || certId}`);
-        resolveActivePolarTarget(14.0); // Pre-check against our 14kn simulated wind velocity
+        resolveActivePolarTarget(14.0); // Target standard 14kn simulated wind velocity profile
       } else if (data && data.rms) {
         options.polarData = data.rms;
         resolveActivePolarTarget(14.0);
@@ -64,13 +62,11 @@ module.exports = function (app) {
     if (!options.polarData) return;
     try {
       const vpp = options.polarData;
-      // Isolate target speeds based on if we are simulating upwind tacks or downwind gybes
       const targetArray = options.maneuverMode === 'gybe' ? vpp.vmgDownwind : vpp.vmgUpwind;
       
       if (targetArray && Array.isArray(targetArray)) {
-        // Find the closest step match inside the certificate's array
         let match = targetArray.find(item => twsKnots <= item.tws);
-        if (!match) match = targetArray[targetArray.length - 1]; // Boundary fallback
+        if (!match) match = targetArray[targetArray.length - 1]; 
         
         if (match && match.vboat) {
           orcTargetSTW = match.vboat;
@@ -85,10 +81,14 @@ module.exports = function (app) {
   function generateAndBroadcastNMEA() {
     simStep++;
     
-    // Process the dynamic efficiency scalars (e.g. fluctuating between 92% and 98%)
-    let minPerf = (options.minPerformance || 92) / 100;
-    let maxPerf = (options.maxPerformance || 98) / 100;
-    let randomVarianceScalar = minPerf + (Math.random() * (maxPerf - minPerf));
+    // --- Performance Update Frequency Logic ---
+    // Change the performance scalar variation step interval based on configuration (ticks are 100ms each)
+    let performanceUpdateTicks = (options.perfUpdateInterval || 5) * 10; 
+    if (simStep % performanceUpdateTicks === 1 || simStep === 1) {
+      let minPerf = (options.minPerformance || 92) / 100;
+      let maxPerf = (options.maxPerformance || 98) / 100;
+      randomVarianceScalar = minPerf + (Math.random() * (maxPerf - minPerf));
+    }
 
     // Dynamic target velocity tracking based directly on ORC values
     let targetSTWKnots = orcTargetSTW * randomVarianceScalar;
@@ -98,11 +98,16 @@ module.exports = function (app) {
     let entryAwaDeg = isGybeMode ? 145 : 32; 
     let deadZoneAwaDeg = isGybeMode ? 180 : 0;  
 
-    let loopStep = simStep % 400;
+    // --- Maneuver Interval Logic ---
+    // Convert maneuver configuration seconds directly to 10Hz array loop size
+    let totalLoopTicks = (options.maneuverInterval || 45) * 10;
+    let loopStep = simStep % totalLoopTicks;
+
     let currentSTWKnots = targetSTWKnots;
     let currentAWADeg = entryAwaDeg;
-    let currentRudderDeg = 0;
+    let currentRudderDeg = 0.0;
 
+    // Execute the maneuver window profile in the first 32 seconds of the loop
     if (loopStep >= 50 && loopStep < 70) {
       let progress = (loopStep - 50) / 20;
       currentRudderDeg = (isGybeMode ? -10 : 8) * progress;
@@ -118,22 +123,37 @@ module.exports = function (app) {
     } 
     else if (loopStep >= 115 && loopStep < 320) {
       let progress = (loopStep - 115) / 205;
-      currentRudderDeg = (isGybeMode ? 2 : -2); 
+      currentRudderDeg = (isGybeMode ? 2 : -2) * (1.0 - progress); // Return helm smoothly to center
       let exitTargetAwa = isGybeMode ? 145 : 32;
       currentAWADeg = exitTargetAwa;
       let accelerationFactor = 0.55 + (0.45 * Math.sqrt(progress));
       currentSTWKnots = targetSTWKnots * accelerationFactor;
     }
+    else {
+      // Steady sailing context baseline
+      currentRudderDeg = 0.0;
+      currentAWADeg = entryAwaDeg;
+      currentSTWKnots = targetSTWKnots;
+    }
 
-    // Append NMEA 0183 output packets
+    // --- Generate Output NMEA Sentences ---
+    // $IIVHW: Speed Through Water
     let vhw = `IIVHW,,T,,M,${currentSTWKnots.toFixed(2)},N,,K`;
     let vhwSentence = appendChecksum(vhw);
 
+    // $IIMWV: Apparent Wind Direction & Speed
     let awaFormatted = currentAWADeg < 0 ? 360 + currentAWADeg : currentAWADeg;
     let mwv = `IIMWV,${awaFormatted.toFixed(1)},R,${baseAWSKnots.toFixed(1)},N,A`;
     let mwvSentence = appendChecksum(mwv);
 
-    const payload = `${vhwSentence}\r\n${mwvSentence}\r\n`;
+    // $IIRSA: Rudder Sensor Angle (Starboard/Port alignment tracking strings)
+    // Format: $IIRSA,StbdAngle,A,PortAngle,A*Checksum
+    let rudderStr = currentRudderDeg.toFixed(1);
+    let rsa = `IIRSA,${rudderStr},A,,`;
+    let rsaSentence = appendChecksum(rsa);
+
+    // Send payload out over UDP link channel
+    const payload = `${vhwSentence}\r\n${mwvSentence}\r\n${rsaSentence}\r\n`;
     udpClient.send(payload, 2222, '127.0.0.1');
   }
 
@@ -161,8 +181,10 @@ module.exports = function (app) {
         enum: ['tack', 'gybe'],
         enumNames: ['Tacking (Upwind Testing Sequence)', 'Gybing (Downwind Testing Sequence)']
       },
-      orcCertId: { type: 'string', title: 'ORC Certificate Ref ID String (e.g., 03200002P4H)', default: '03200002P4H' },
-      simTargetStw: { type: 'number', title: 'Baseline Backup Speed (Knots - used if ORC fails)', default: 7.80 },
+      maneuverInterval: { type: 'number', title: 'How often to trigger a maneuver (Seconds)', default: 45 },
+      perfUpdateInterval: { type: 'number', title: 'How often wind variance & performance changes (Seconds)', default: 5 },
+      orcCertId: { type: 'string', title: 'ORC Certificate Ref ID String', default: '03200002P4H' },
+      simTargetStw: { type: 'number', title: 'Baseline Backup Speed (Knots)', default: 7.80 },
       minPerformance: { type: 'number', title: 'Minimum Target Performance Filter Range (%)', default: 92 },
       maxPerformance: { type: 'number', title: 'Maximum Target Performance Filter Range (%)', default: 98 }
     }
