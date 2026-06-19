@@ -11,16 +11,22 @@ module.exports = function (app) {
   plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificate VPP matrices.';
 
   let simStep = 0;
-  let isCurrentlyStarboard = true; // Tracks the starting tack state for the current interval loop
+  let isCurrentlyStarboard = true;
+  let verifiedVesselName = 'None - Waiting for valid API sync...';
 
-  // Base internal fallbacks (Overwritten upon successful API fetch)
+  // Base internal fallbacks
   let orcTargetSTW = 7.80;   
   let orcTargetAngle = 32.0; 
   let randomVarianceScalar = 0.95; 
 
   plugin.start = function (startOptions) {
     options = startOptions || {};
-    isCurrentlyStarboard = true; // Reset state on startup
+    isCurrentlyStarboard = true;
+
+    // Retain verified name across server restarts if already saved in config
+    if (options.lastVerifiedVessel) {
+      verifiedVesselName = options.lastVerifiedVessel;
+    }
 
     if (options.orcCertRef) {
       fetchOrcPolarMatrix(options.orcCertRef);
@@ -61,6 +67,20 @@ module.exports = function (app) {
         
         if (activeBoatRecord.vpp) {
           options.polarData = activeBoatRecord.vpp;
+          
+          // Capture the official vessel name from the root of the database entry
+          if (activeBoatRecord.YachtName) {
+            verifiedVesselName = `${activeBoatRecord.YachtName} (${activeBoatRecord.SailNo || 'No Sail Number'})`;
+            
+            // Persist the name directly into Signal K's plugin config file
+            if (options.lastVerifiedVessel !== verifiedVesselName) {
+              options.lastVerifiedVessel = verifiedVesselName;
+              app.savePluginOptions(options, () => {
+                app.debug(`[ORC Config UI Sync] Configuration metadata updated with vessel name: ${verifiedVesselName}`);
+              });
+            }
+          }
+
           app.debug(`[ORC Engine Init] Successfully bound VPP polar matrices for boat reference: ${certId}`);
           resolveActivePolarTarget(14.0); 
         } else {
@@ -114,7 +134,6 @@ module.exports = function (app) {
 
     let isGybeMode = options.maneuverMode === 'gybe';
     
-    // Safety Fallback Guard
     let activeTargetAngle = orcTargetAngle;
     let activeTargetSTW = orcTargetSTW;
     
@@ -132,13 +151,10 @@ module.exports = function (app) {
     let totalLoopTicks = (options.maneuverInterval || 45) * 10;
     let loopStep = simStep % totalLoopTicks;
 
-    // Flip-flop the tack orientation flag cleanly at the precise boundary reset tick
     if (loopStep === 0 && simStep > 1) {
       isCurrentlyStarboard = !isCurrentlyStarboard;
-      app.debug(`[Simulation Clock Reset] Swapping active tracking orientation. New starting board: ${isCurrentlyStarboard ? 'Starboard' : 'Port'}`);
     }
 
-    // Direction scalar modifier: 1 if maneuvering from STBD -> PORT, -1 if PORT -> STBD
     let side = isCurrentlyStarboard ? 1 : -1;
 
     let entryAwa = activeTargetAngle * side;  
@@ -149,31 +165,25 @@ module.exports = function (app) {
     let currentAWADeg = entryAwa;
     let currentRudderDeg = 0.0;
 
-    // --- Dynamic Sailing Physics Engine Execution Loop ---
     if (isGybeMode) {
-      // DOWNWIND TWIN-AXIS CONTINUOUS GYBING LOOPS
       if (loopStep >= 0 && loopStep < 30) {
         let progress = loopStep / 30;
         currentRudderDeg = -5 * side * progress; 
-        
-        let targetBoundary = 180 * side; // Sweeping toward 180 or -180
+        let targetBoundary = 180 * side;
         currentAWADeg = entryAwa + ((targetBoundary - entryAwa) * progress);
         currentSTWKnots = baseSTWKnots - ((baseSTWKnots * 0.10) * progress);
       }
       else if (loopStep >= 30 && loopStep < 70) {
         let progress = (loopStep - 30) / 40;
         currentRudderDeg = -12 * side; 
-        
         let startAngle = 180 * side;
         let targetEndUnwrapped = dynamicOvershootAwa;
         
-        // Correct the unwrap logic to support both directions crossing the 180 split line
         if (side === 1 && targetEndUnwrapped < 0) targetEndUnwrapped += 360;
         if (side === -1 && targetEndUnwrapped > 0) targetEndUnwrapped -= 360;
         
         let rawSweep = startAngle + ((targetEndUnwrapped - startAngle) * progress);
         
-        // Normalize coordinates back safely inside -180 to 180 bounds
         if (rawSweep > 180) currentAWADeg = rawSweep - 360;
         else if (rawSweep < -180) currentAWADeg = rawSweep + 360;
         else currentAWADeg = rawSweep;
@@ -185,7 +195,6 @@ module.exports = function (app) {
         let progress = (loopStep - 70) / 100;
         currentRudderDeg = 4 * side * (1 - progress); 
         currentAWADeg = dynamicOvershootAwa + ((exitAwa - dynamicOvershootAwa) * Math.pow(progress, 2));
-        
         let lowestSpeed = baseSTWKnots * 0.65;
         currentSTWKnots = lowestSpeed + ((baseSTWKnots - lowestSpeed) * Math.sqrt(progress));
       }
@@ -195,7 +204,6 @@ module.exports = function (app) {
         currentSTWKnots = baseSTWKnots;
       }
     } else {
-      // UPWIND TWIN-AXIS CONTINUOUS TACKING LOOPS
       if (loopStep >= 0 && loopStep < 30) {
         let progress = loopStep / 30;
         currentRudderDeg = 6 * side * progress;
@@ -223,7 +231,6 @@ module.exports = function (app) {
       }
     }
 
-    // --- Format and Broadcast NMEA 0183 Output Sentences ---
     let vhw = `IIVHW,,T,,M,${currentSTWKnots.toFixed(2)},N,,K`;
     let vhwSentence = appendChecksum(vhw);
 
@@ -251,24 +258,34 @@ module.exports = function (app) {
     if (simInterval) clearInterval(simInterval);
   };
 
-  plugin.schema = {
-    type: 'object',
-    title: 'H5000 Network UDP Simulator Controls',
-    properties: {
-      enableSimulation: { type: 'boolean', title: 'Enable Simulator Output Feed', default: false },
-      maneuverMode: { 
-        type: 'string', 
-        title: 'Maneuver Simulation Track Target', 
-        default: 'tack',
-        enum: ['tack', 'gybe'],
-        enumNames: ['Tacking (Upwind Testing Sequence)', 'Gybing (Downwind Testing Sequence)']
-      },
-      maneuverInterval: { type: 'number', title: 'Maneuver Interval Cycles (Seconds)', default: 45 },
-      perfUpdateInterval: { type: 'number', title: 'Performance Scalar Step Changes (Seconds)', default: 5 },
-      orcCertRef: { type: 'string', title: 'ORC Certificate ID Reference or URL Link', default: '03200002P4H' },
-      minPerformance: { type: 'number', title: 'Minimum Target Performance Filter Range (%)', default: 92 },
-      maxPerformance: { type: 'number', title: 'Maximum Target Performance Filter Range (%)', default: 98 }
-    }
+  // Dynamic schema generator to dynamically render the active vessel name in the Server Admin UI
+  plugin.getSettingsSchema = function () {
+    return {
+      type: 'object',
+      title: 'H5000 Network UDP Simulator Controls',
+      properties: {
+        enableSimulation: { type: 'boolean', title: 'Enable Simulator Output Feed', default: false },
+        maneuverMode: { 
+          type: 'string', 
+          title: 'Maneuver Simulation Track Target', 
+          default: 'tack',
+          enum: ['tack', 'gybe'],
+          enumNames: ['Tacking (Upwind Testing Sequence)', 'Gybing (Downwind Testing Sequence)']
+        },
+        maneuverInterval: { type: 'number', title: 'Maneuver Interval Cycles (Seconds)', default: 45 },
+        perfUpdateInterval: { type: 'number', title: 'Performance Scalar Step Changes (Seconds)', default: 5 },
+        orcCertRef: { type: 'string', title: 'ORC Certificate ID Reference or URL Link', default: '03200002P4H' },
+        lastVerifiedVessel: { 
+          type: 'string', 
+          title: 'Active Verified Vessel Status:', 
+          description: 'This updates automatically when the ORC database connection succeeds.',
+          default: verifiedVesselName,
+          readonly: true 
+        },
+        minPerformance: { type: 'number', title: 'Minimum Target Performance Filter Range (%)', default: 92 },
+        maxPerformance: { type: 'number', title: 'Maximum Target Performance Filter Range (%)', default: 98 }
+      }
+    };
   };
 
   return plugin;
