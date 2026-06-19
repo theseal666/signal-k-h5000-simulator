@@ -8,14 +8,15 @@ module.exports = function (app) {
   const udpClient = dgram.createSocket('udp4');
 
   plugin.id = 'signal-k-h5000-simulator';
-  plugin.name = 'B&G H5000 Network Simulator (Dynamic ORC Registry)';
-  plugin.description = 'Fetches real-time fleet polar matrices from the ORC registry based on your country code and populates an interactive boat selection list.';
+  plugin.name = 'B&G H5000 Network Simulator (UDP Sentences)';
+  plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificates with live config reload, dynamic wind stepping, and performance scalar integration.';
 
   let simStep = 0;
   let isCurrentlyStarboard = true;
-  let verifiedVesselName = 'None';
+  let verifiedVesselName = 'None - Waiting for valid API sync...';
   let verifiedCertRef = 'None';
 
+  // Environmental Tracking & Target Matrices
   let currentTWSRegime = 14.0;
   const orcWindSpectrum = [4, 6, 8, 10, 12, 14, 16, 20, 24];
   
@@ -23,12 +24,12 @@ module.exports = function (app) {
   let orcTargetAngle = 37.8; 
   let randomVarianceScalar = 0.95; 
 
+  // Damping States to mimic B&G H5000 processing delays
   let filteredVMG = 0.0;
-  const dampingFactor = 0.033; // ~3-second damping window at 10Hz
-
-  let cachedBoatsForSelectedCountry = [];
+  const dampingFactor = 0.033; // ~3-second damping window at 10Hz output
 
   plugin.start = function (startOptions) {
+    // Clear any active intervals if start is triggered during a live configuration save reload
     if (simInterval) {
       clearInterval(simInterval);
       simInterval = null;
@@ -37,8 +38,20 @@ module.exports = function (app) {
     options = startOptions || {};
     isCurrentlyStarboard = true;
 
-    // Load polar values for the chosen boat right away
-    refreshActivePolarPayload();
+    if (options.lastVerifiedVessel) {
+      verifiedVesselName = options.lastVerifiedVessel;
+      plugin.schema.properties.lastVerifiedVessel.default = verifiedVesselName;
+    }
+    if (options.lastVerifiedCert) {
+      verifiedCertRef = options.lastVerifiedCert;
+      plugin.schema.properties.lastVerifiedCert.default = verifiedCertRef;
+    }
+
+    const searchName = options.orcYachtName ? options.orcYachtName.trim() : 'Karukera';
+    const searchCountry = options.orcCountryId ? options.orcCountryId.trim() : 'SWE';
+
+    // Instantly sync matrices from registry on save apply without requiring a container restart
+    fetchOrcPolarMatrixByName(searchName, searchCountry);
 
     if (options.enableSimulation) {
       simInterval = setInterval(() => {
@@ -47,46 +60,8 @@ module.exports = function (app) {
     }
   };
 
-  // Signal K lifecycle hook to populate the configuration schema dynamically
-  plugin.configureSchema = async function () {
-    const targetCountry = (options.orcCountryId || 'SWE').trim().toUpperCase();
-
-    try {
-      // Fetch all boats registered under the chosen country prefix
-      const url = `https://data.orc.org/public/WPub.dll?action=DownRMS&CountryId=${targetCountry}&Family=ORC&ext=json`;
-      app.debug(`Simulator downloading fleet registry for country: ${targetCountry}`);
-      
-      const rawJson = await makeHttpRequest(url);
-      const data = JSON.parse(rawJson);
-      const records = data && data.rms ? data.rms : [];
-      
-      cachedBoatsForSelectedCountry = records.map(boat => ({
-        id: boat.RefNo || boat.YachtName,
-        title: `${boat.YachtName || 'Unknown'} [${boat.SailNo || 'No Sail ID'}]`
-      })).sort((a, b) => a.title.localeCompare(b.title));
-
-    } catch (e) {
-      app.debug(`Could not sync ORC fleet registry for ${targetCountry}: ${e.message}`);
-    }
-
-    // Map the fetched boats straight into the configuration dropdown schema
-    if (cachedBoatsForSelectedCountry.length > 0) {
-      plugin.schema.properties.orcSelectedVesselToken.enum = cachedBoatsForSelectedCountry.map(b => b.id);
-      plugin.schema.properties.orcSelectedVesselToken.enumNames = cachedBoatsForSelectedCountry.map(b => b.title);
-      plugin.schema.properties.orcSelectedVesselToken.description = `Successfully loaded ${cachedBoatsForSelectedCountry.length} active certificates for country group: ${targetCountry}`;
-    } else {
-      plugin.schema.properties.orcSelectedVesselToken.enum = ['None'];
-      plugin.schema.properties.orcSelectedVesselToken.enumNames = [`No active certificates found for country "${targetCountry}"`];
-      plugin.schema.properties.orcSelectedVesselToken.description = `Try clicking 'Save Configuration' after entering a valid 3-letter country code.`;
-    }
-
-    return plugin.schema;
-  };
-
-  function refreshActivePolarPayload() {
-    if (!options.orcSelectedVesselToken || options.orcSelectedVesselToken === 'None') return;
-
-    const url = `https://data.orc.org/public/WPub.dll?action=DownBoatRMS&RefNo=${encodeURIComponent(options.orcSelectedVesselToken)}&ext=json`;
+  function fetchOrcPolarMatrixByName(yachtName, countryId) {
+    const url = `https://data.orc.org/public/WPub.dll?action=DownBoatRMS&YachtName=${encodeURIComponent(yachtName)}&CountryId=${encodeURIComponent(countryId)}&ext=json`;
     
     https.get(url, (res) => {
       let body = '';
@@ -94,29 +69,43 @@ module.exports = function (app) {
       res.on('end', () => {
         try {
           const data = JSON.parse(body);
-          const records = data && data.rms ? data.rms : [];
-          if (records.length > 0 && records[0].Allowances) {
-            options.polarData = records[0].Allowances;
-            verifiedVesselName = `${records[0].YachtName || 'Unknown'} (${records[0].SailNo || ''})`;
-            verifiedCertRef = records[0].RefNo || options.orcSelectedVesselToken;
-            resolveActivePolarTarget(currentTWSRegime);
-            app.debug(`[ORC Sync Complete] Target Matrix Locked for: ${verifiedVesselName}`);
+          let recordArray = data && data.rms ? data.rms : (Array.isArray(data) ? data : []);
+
+          if (recordArray.length > 0) {
+            const activeBoatRecord = recordArray[0];
+            
+            if (activeBoatRecord.Allowances) {
+              options.polarData = activeBoatRecord.Allowances;
+              
+              const craftName = activeBoatRecord.YachtName || yachtName;
+              const sailNum = activeBoatRecord.SailNo || '';
+              
+              verifiedVesselName = sailNum ? `${craftName} (${sailNum})` : craftName;
+              plugin.schema.properties.lastVerifiedVessel.default = verifiedVesselName;
+              
+              verifiedCertRef = activeBoatRecord.RefNo || 'Found';
+              plugin.schema.properties.lastVerifiedCert.default = verifiedCertRef;
+              
+              if (options.lastVerifiedVessel !== verifiedVesselName || options.lastVerifiedCert !== verifiedCertRef) {
+                options.lastVerifiedVessel = verifiedVesselName;
+                options.lastVerifiedCert = verifiedCertRef;
+                app.savePluginOptions(options, () => {
+                  app.debug(`[Live Configuration Update] Loaded Matrix: ${verifiedVesselName} | Cert: ${verifiedCertRef}`);
+                });
+              }
+
+              resolveActivePolarTarget(currentTWSRegime); 
+            } else {
+              app.error(`Matched record structure, but Allowances data map was absent.`);
+            }
+          } else {
+            app.error(`No active certification criteria matched on the database server for: ${yachtName} (${countryId})`);
           }
         } catch (e) {
           app.error(`Failed parsing target polar data from registry: ${e.message}`);
         }
       });
-    }).on('error', (err) => app.error(`Network communication error: ${err.message}`));
-  }
-
-  function makeHttpRequest(url) {
-    return new Promise((resolve, reject) => {
-      https.get(url, (res) => {
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
-        res.on('end', () => resolve(data));
-      }).on('error', (err) => reject(err));
-    });
+    }).on('error', (err) => app.error(`Simulator live ORC network synchronization failed: ${err.message}`));
   }
 
   function resolveActivePolarTarget(twsKnots) {
@@ -147,17 +136,22 @@ module.exports = function (app) {
   function generateAndBroadcastNMEA() {
     simStep++;
     
+    // Performance Step Scalar Interval processing logic
     let performanceUpdateTicks = (options.perfUpdateInterval || 5) * 10; 
     if (simStep % performanceUpdateTicks === 1 || simStep === 1) {
+      // 1. Shift environment to a new target speed regime out of the parsed matrix array
       let currentIdx = orcWindSpectrum.indexOf(currentTWSRegime);
       let nextIdx = (currentIdx + 1) % orcWindSpectrum.length;
       currentTWSRegime = orcWindSpectrum[nextIdx];
 
+      // 2. Compute randomized variance performance filter target percentage
       let minPerf = (options.minPerformance || 92) / 100;
       let maxPerf = (options.maxPerformance || 98) / 100;
       randomVarianceScalar = minPerf + (Math.random() * (maxPerf - minPerf));
       
+      // 3. Recalculate targets with new wind rules applied
       resolveActivePolarTarget(currentTWSRegime); 
+      app.debug(`[Wind Step Update] Wind Shifted: ${currentTWSRegime} kn | Target Performance Load: ${(randomVarianceScalar * 100).toFixed(1)}%`);
     }
 
     let isGybeMode = options.maneuverMode === 'gybe';
@@ -179,6 +173,7 @@ module.exports = function (app) {
     let currentAWADeg = entryAwa;
     let currentRudderDeg = 0.0;
 
+    // Maneuver Turn Logic Sourced from Live Polar Angle Targets
     if (isGybeMode) {
       if (loopStep >= 0 && loopStep < 30) {
         let progress = loopStep / 30;
@@ -230,6 +225,7 @@ module.exports = function (app) {
       }
     }
 
+    // Apparent Wind Angle Vector Calculations
     let awaRad = (currentAWADeg * Math.PI) / 180;
     let awsKnots = currentTWSRegime; 
     
@@ -237,15 +233,22 @@ module.exports = function (app) {
     let apparentY = awsKnots * Math.sin(awaRad);
     let derivedTWADeg = Math.abs(Math.atan2(apparentY, apparentX) * 180 / Math.PI);
 
+    // Compute unfiltered dynamic VMG
     let twaRad = (derivedTWADeg * Math.PI) / 180;
     let rawVMGKnots = Math.abs(currentSTWKnots * Math.cos(twaRad));
+    
+    // Instrument Damping Filter (Prevents immediate zeroing on tacks)
     filteredVMG = filteredVMG + dampingFactor * (rawVMGKnots - filteredVMG);
 
+    // Assembly
     let vhwSentence = appendChecksum(`IIVHW,,T,,M,${currentSTWKnots.toFixed(2)},N,,K`);
+    
     let awaFormatted = currentAWADeg < 0 ? 360 + currentAWADeg : currentAWADeg;
     let mwvApparentSentence = appendChecksum(`IIMWV,${awaFormatted.toFixed(1)},R,${awsKnots.toFixed(1)},N,A`);
+
     let twaFormatted = currentAWADeg < 0 ? 360 - derivedTWADeg : derivedTWADeg;
     let mwvTrueSentence = appendChecksum(`IIMWV,${twaFormatted.toFixed(1)},T,${currentTWSRegime.toFixed(1)},N,A`);
+    
     let vmgSentence = appendChecksum(`IIVMG,${filteredVMG.toFixed(2)},N,,`);
     let rsaSentence = appendChecksum(`IIRSA,${currentRudderDeg.toFixed(1)},A,,`);
 
@@ -265,27 +268,35 @@ module.exports = function (app) {
 
   plugin.schema = {
     type: 'object',
-    title: 'H5000 Dynamic ORC Fleet Registry Simulator',
+    title: 'H5000 Network UDP Simulator Controls',
     properties: {
       enableSimulation: { type: 'boolean', title: 'Enable Simulator Output Feed', default: false },
-      maneuverMode: { type: 'string', title: 'Maneuver Track', default: 'tack', enum: ['tack', 'gybe'] },
-      maneuverInterval: { type: 'number', title: 'Maneuver Interval (Seconds)', default: 45 },
-      perfUpdateInterval: { type: 'number', title: 'Wind Step Interval (Seconds)', default: 10 },
-      orcCountryId: { 
+      maneuverMode: { 
         type: 'string', 
-        title: '1. Country Prefix Code (3-Letters)', 
-        default: 'SWE',
-        description: 'Type a country code (e.g. SWE, USA, GBR, GER, FRA) and hit Save to load its boats.'
+        title: 'Maneuver Simulation Track Target', 
+        default: 'tack',
+        enum: ['tack', 'gybe'],
+        enumNames: ['Tacking (Upwind Testing Sequence)', 'Gybing (Downwind Testing Sequence)']
       },
-      orcSelectedVesselToken: { 
+      maneuverInterval: { type: 'number', title: 'Maneuver Interval Cycles (Seconds)', default: 45 },
+      perfUpdateInterval: { type: 'number', title: 'Performance Scalar Step Changes (Seconds)', default: 5 },
+      orcYachtName: { type: 'string', title: 'ORC Yacht Name Lookup Field', default: 'Karukera' },
+      orcCountryId: { type: 'string', title: 'ORC Country Prefix Code', default: 'SWE' },
+      lastVerifiedVessel: { 
         type: 'string', 
-        title: '2. Select Active Certificate Profile', 
+        title: 'Active Verified Vessel Status', 
+        default: 'None - Waiting for valid API sync...',
+        readonly: true 
+      },
+      lastVerifiedCert: { 
+        type: 'string', 
+        title: 'Live Verified Certificate #', 
+        description: 'The real-time reference ID returned by the ORC registry.',
         default: 'None',
-        enum: ['None'],
-        enumNames: ['Type a country prefix and save to pull fleet records...']
+        readonly: true 
       },
-      minPerformance: { type: 'number', title: 'Min Performance (%)', default: 92 },
-      maxPerformance: { type: 'number', title: 'Max Performance (%)', default: 98 }
+      minPerformance: { type: 'number', title: 'Minimum Target Performance Filter Range (%)', default: 92 },
+      maxPerformance: { type: 'number', title: 'Maximum Target Performance Filter Range (%)', default: 98 }
     }
   };
 
