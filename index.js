@@ -13,6 +13,7 @@ module.exports = function (app) {
   let simStep = 0;
   let isCurrentlyStarboard = true;
   let verifiedVesselName = 'None - Waiting for valid API sync...';
+  let verifiedCertRef = 'None';
 
   // Base internal fallbacks (Calculated from Karukera's 14kt target benchmarks)
   let orcTargetSTW = 5.85;   
@@ -27,57 +28,31 @@ module.exports = function (app) {
       verifiedVesselName = options.lastVerifiedVessel;
       plugin.schema.properties.lastVerifiedVessel.default = verifiedVesselName;
     }
-
-    if (options.orcCertRef) {
-      fetchOrcPolarMatrix(options.orcCertRef);
+    if (options.lastVerifiedCert) {
+      verifiedCertRef = options.lastVerifiedCert;
+      plugin.schema.properties.lastVerifiedCert.default = verifiedCertRef;
     }
 
-    if (options.enableSimulation) {
-      simInterval = setInterval(() => {
-        generateAndBroadcastNMEA();
-      }, 100);
+    const searchName = options.orcYachtName ? options.orcYachtName.trim() : '';
+    const searchCountry = options.orcCountryId ? options.orcCountryId.trim() : '';
+
+    if (searchName && searchCountry) {
+      fetchOrcPolarMatrixByName(searchName, searchCountry);
     }
   };
 
-  async function fetchOrcPolarMatrix(inputString) {
-    const certId = inputString.trim().toUpperCase();
-    if (!certId) {
-      app.error(`Simulator received an empty ORC reference identifier link.`);
-      return;
-    }
-
-    const urlPrimary = `https://data.orc.org/public/WPub.dll?action=DownBoatRMS&RefNo=${encodeURIComponent(certId)}&ext=json`;
-    const urlActiveSeason = `https://data.orc.org/public/WPub.dll?action=activecerts&CountryId=SWE&Family=1&VPPYear=2026&ext=json`;
+  async function fetchOrcPolarMatrixByName(yachtName, countryId) {
+    // URL structured exactly as requested to query using Name and Country
+    const url = `https://data.orc.org/public/WPub.dll?action=DownBoatRMS&YachtName=${encodeURIComponent(yachtName)}&CountryId=${encodeURIComponent(countryId)}&ext=json`;
     
     try {
-      app.debug(`Simulator querying live official ORC endpoint: ${urlPrimary}`);
+      app.debug(`Simulator querying live official ORC endpoint: ${url}`);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 8000);
       
-      let response = await fetch(urlPrimary, { signal: controller.signal });
+      const response = await fetch(url, { signal: controller.signal });
       let data = await response.json();
       clearTimeout(timeoutId);
-
-      // Dynamic Fallback: If archive search drops empty, run targeted scan of active 2026 fleet catalog
-      if (!data || data.status === 404 || (Array.isArray(data.rms) && data.rms.length === 0) || (Array.isArray(data) && data.length === 0)) {
-        app.debug(`RefNo not found in historical archive. Scanning active 2026 Swedish regional registry...`);
-        const activeController = new AbortController();
-        const activeTimeoutId = setTimeout(() => activeController.abort(), 8000);
-        
-        const activeResponse = await fetch(urlActiveSeason, { signal: activeController.signal });
-        const activeData = await activeResponse.json();
-        clearTimeout(activeTimeoutId);
-
-        const activeList = activeData.rms || (Array.isArray(activeData) ? activeData : []);
-        const matchedVessel = activeList.find(boat => 
-          (boat.RefNo && boat.RefNo.toUpperCase() === certId) || 
-          (boat.YachtName && boat.YachtName.toUpperCase().includes('KARUKERA'))
-        );
-
-        if (matchedVessel) {
-          data = { rms: [matchedVessel] };
-        }
-      }
       
       let recordArray = data && data.rms ? data.rms : (Array.isArray(data) ? data : []);
 
@@ -88,24 +63,30 @@ module.exports = function (app) {
         if (vppBlock) {
           options.polarData = vppBlock;
           
-          const craftName = activeBoatRecord.YachtName || activeBoatRecord.yachtName || 'Karukera';
-          const sailNum = activeBoatRecord.SailNo || activeBoatRecord.sailNo || 'SWE 1220';
+          const craftName = activeBoatRecord.YachtName || activeBoatRecord.yachtName || yachtName;
+          const sailNum = activeBoatRecord.SailNo || activeBoatRecord.sailNo || '';
           
-          verifiedVesselName = `${craftName} (${sailNum})`;
+          verifiedVesselName = sailNum ? `${craftName} (${sailNum})` : craftName;
           plugin.schema.properties.lastVerifiedVessel.default = verifiedVesselName;
           
-          if (options.lastVerifiedVessel !== verifiedVesselName) {
+          // Capture and verify the certificate reference number from the object response
+          verifiedCertRef = activeBoatRecord.RefNo || activeBoatRecord.refNo || 'Found';
+          plugin.schema.properties.lastVerifiedCert.default = verifiedCertRef;
+          
+          // Persist back to configurations schema storage if anything changed
+          if (options.lastVerifiedVessel !== verifiedVesselName || options.lastVerifiedCert !== verifiedCertRef) {
             options.lastVerifiedVessel = verifiedVesselName;
+            options.lastVerifiedCert = verifiedCertRef;
             app.savePluginOptions(options, () => {
-              app.debug(`[ORC Config UI Sync] Successfully identified vessel: ${verifiedVesselName}`);
+              app.debug(`[ORC Config UI Sync] Found ${verifiedVesselName} | Cert Verification: ${verifiedCertRef}`);
             });
           }
 
-          app.debug(`[ORC Engine Init] Successfully bound VPP polar matrices for boat reference: ${certId}`);
+          app.debug(`[ORC Engine Init] Successfully bound VPP polar matrices for boat reference: ${verifiedCertRef}`);
           resolveActivePolarTarget(14.0); 
         }
       } else {
-        app.error(`No active certification criteria matched on the database server for Reference Number: ${certId}`);
+        app.error(`No active certification criteria matched on the database server for: ${yachtName} (${countryId})`);
       }
     } catch (err) {
       app.error(`Simulator live ORC network synchronization failed: ${err.message}`);
@@ -135,7 +116,7 @@ module.exports = function (app) {
           app.debug(`[ORC Polar Update] Live Targets -> STW: ${orcTargetSTW.toFixed(2)} kn | Wind Angle: ${orcTargetAngle.toFixed(1)}°`);
         }
       } else {
-        // Fallback hard calculations extracted precisely from your MAT 1220 14-knot baseline limits
+        // Safe defaults if arrays aren't matched cleanly
         if (isGybeMode) {
           orcTargetSTW = 8.71;   
           orcTargetAngle = 152.0; 
@@ -300,12 +281,20 @@ module.exports = function (app) {
       },
       maneuverInterval: { type: 'number', title: 'Maneuver Interval Cycles (Seconds)', default: 45 },
       perfUpdateInterval: { type: 'number', title: 'Performance Scalar Step Changes (Seconds)', default: 5 },
-      orcCertRef: { type: 'string', title: 'ORC Certificate ID Reference or URL Link', default: '03200002P4H' },
+      orcYachtName: { type: 'string', title: 'ORC Yacht Name Lookup Field', default: 'Karukera' },
+      orcCountryId: { type: 'string', title: 'ORC Country Prefix Code', default: 'SWE' },
       lastVerifiedVessel: { 
         type: 'string', 
         title: 'Active Verified Vessel Status', 
         description: 'Updates automatically when the database sync completes.',
         default: 'None - Waiting for valid API sync...',
+        readonly: true 
+      },
+      lastVerifiedCert: { 
+        type: 'string', 
+        title: 'Live Verified Certificate #', 
+        description: 'The real-time reference ID returned by the ORC registry.',
+        default: 'None',
         readonly: true 
       },
       minPerformance: { type: 'number', title: 'Minimum Target Performance Filter Range (%)', default: 92 },
