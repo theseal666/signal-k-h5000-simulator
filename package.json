@@ -9,7 +9,7 @@
   ],
   "signalk": {
     "appConnectionId": "signal-k-h5000-simulator",
-    "displayName": "ORC VPP Performance Matrix Tracker",
+    "displayName": "B&G H5000 Matrix Display",
     "webapp": "public"
   },
   "dependencies": {}
