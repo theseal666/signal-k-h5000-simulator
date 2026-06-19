@@ -1,7 +1,5 @@
 const dgram = require('dgram');
 const https = require('https');
-const express = require('express');
-const path = require('path');
 
 module.exports = function (app) {
   const plugin = {};
@@ -29,15 +27,6 @@ module.exports = function (app) {
   // Damping States to mimic B&G H5000 processing delays
   let filteredVMG = 0.0;
   const dampingFactor = 0.033; // ~3-second damping window at 10Hz output
-
-  // Explicitly host the public folder so Signal K can display the Webapp UI
-  if (app.registerPublicWebapp) {
-    // Modern Signal K way
-    app.registerPublicWebapp('/' + plugin.id, path.join(__dirname, 'public'));
-  } else if (app.use) {
-    // Fallback standard express routing
-    app.use('/' + plugin.id, express.static(path.join(__dirname, 'public')));
-  }
 
   plugin.start = function (startOptions) {
     if (simInterval) {
