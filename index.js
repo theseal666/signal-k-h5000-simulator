@@ -6,10 +6,9 @@ module.exports = function (app) {
   let options = {};
   const udpClient = dgram.createSocket('udp4');
 
-  // Hardcoded identity specifications to guarantee listing registration
   plugin.id = 'signal-k-h5000-simulator';
   plugin.name = 'B&G H5000 Network Simulator';
-  plugin.description = 'Generates high-frequency custom performance polar matrices and transmits sentences over NMEA 0183 / UDP.';
+  plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificates.';
 
   let simStep = 0;
   let isCurrentlyStarboard = true;
@@ -26,7 +25,6 @@ module.exports = function (app) {
     options = startOptions || {};
     isCurrentlyStarboard = true;
 
-    // Run the high frequency generation loop if enabled
     if (options.enableSimulation !== false) {
       simInterval = setInterval(() => {
         generateAndBroadcastNMEA();
@@ -37,7 +35,6 @@ module.exports = function (app) {
   function generateAndBroadcastNMEA() {
     simStep++;
     
-    // Fallback checks read your exact field name configurations safely
     let stepInterval = (options.perfUpdateInterval || 300) * 10; 
     if (simStep % stepInterval === 1 || simStep === 1) {
       let currentIdx = orcWindSpectrum.indexOf(currentTWSRegime);
@@ -74,7 +71,7 @@ module.exports = function (app) {
     
     filteredVMG = filteredVMG + dampingFactor * (rawVMGKnots - filteredVMG);
 
-    // Stream live path updates to delta pipeline mechanics
+    // Stream directly into Signal K data browser pipeline
     try {
       app.handleMessage(plugin.id, {
         updates: [
@@ -90,7 +87,7 @@ module.exports = function (app) {
       });
     } catch (err) {}
 
-    // Generate NMEA strings to feed your network dependencies
+    // Stream NMEA 0183 payload over raw UDP
     let vhwSentence = appendChecksum(`IIVHW,,T,,M,${currentSTWKnots.toFixed(2)},N,,K`);
     let awaFormatted = currentAWADeg < 0 ? 360 + currentAWADeg : currentAWADeg;
     let mwvApparentSentence = appendChecksum(`IIMWV,${awaFormatted.toFixed(1)},R,${awsKnots.toFixed(1)},N,A`);
@@ -118,7 +115,7 @@ module.exports = function (app) {
     }
   };
 
-  // The properties keys must match your configuration UI screenshots identically
+  // Explicit parameters matching your layout configurations exactly
   plugin.schema = {
     type: 'object',
     title: 'H5000 Network UDP Simulator Controls',
