@@ -1,5 +1,7 @@
 const dgram = require('dgram');
 const https = require('https');
+const express = require('express');
+const path = require('path');
 
 module.exports = function (app) {
   const plugin = {};
@@ -28,8 +30,16 @@ module.exports = function (app) {
   let filteredVMG = 0.0;
   const dampingFactor = 0.033; // ~3-second damping window at 10Hz output
 
+  // Explicitly host the public folder so Signal K can display the Webapp UI
+  if (app.registerPublicWebapp) {
+    // Modern Signal K way
+    app.registerPublicWebapp('/' + plugin.id, path.join(__dirname, 'public'));
+  } else if (app.use) {
+    // Fallback standard express routing
+    app.use('/' + plugin.id, express.static(path.join(__dirname, 'public')));
+  }
+
   plugin.start = function (startOptions) {
-    // Clear any active intervals if start is triggered during a live configuration save reload
     if (simInterval) {
       clearInterval(simInterval);
       simInterval = null;
@@ -50,7 +60,6 @@ module.exports = function (app) {
     const searchName = options.orcYachtName ? options.orcYachtName.trim() : 'Karukera';
     const searchCountry = options.orcCountryId ? options.orcCountryId.trim() : 'SWE';
 
-    // Instantly sync matrices from registry on save apply without requiring a container restart
     fetchOrcPolarMatrixByName(searchName, searchCountry);
 
     if (options.enableSimulation) {
@@ -72,12 +81,10 @@ module.exports = function (app) {
           let recordArray = data && data.rms ? data.rms : (Array.isArray(data) ? data : []);
 
           if (recordArray.length > 0) {
-            // Find an exact case-insensitive match if the server returned multiple boats
             let activeBoatRecord = recordArray.find(boat => 
               boat.YachtName && boat.YachtName.trim().toLowerCase() === yachtName.toLowerCase()
             );
 
-            // Fall back to the first available record if an exact match isn't found
             if (!activeBoatRecord) {
               activeBoatRecord = recordArray[0];
             }
@@ -144,22 +151,17 @@ module.exports = function (app) {
   function generateAndBroadcastNMEA() {
     simStep++;
     
-    // Performance Step Scalar Interval processing logic
     let performanceUpdateTicks = (options.perfUpdateInterval || 5) * 10; 
     if (simStep % performanceUpdateTicks === 1 || simStep === 1) {
-      // 1. Shift environment to a new target speed regime out of the parsed matrix array
       let currentIdx = orcWindSpectrum.indexOf(currentTWSRegime);
       let nextIdx = (currentIdx + 1) % orcWindSpectrum.length;
       currentTWSRegime = orcWindSpectrum[nextIdx];
 
-      // 2. Compute randomized variance performance filter target percentage
       let minPerf = (options.minPerformance || 92) / 100;
       let maxPerf = (options.maxPerformance || 98) / 100;
       randomVarianceScalar = minPerf + (Math.random() * (maxPerf - minPerf));
       
-      // 3. Recalculate targets with new wind rules applied
       resolveActivePolarTarget(currentTWSRegime); 
-      app.debug(`[Wind Step Update] Wind Shifted: ${currentTWSRegime} kn | Target Performance Load: ${(randomVarianceScalar * 100).toFixed(1)}%`);
     }
 
     let isGybeMode = options.maneuverMode === 'gybe';
@@ -232,7 +234,6 @@ module.exports = function (app) {
       }
     }
 
-    // Apparent Wind Angle Vector Calculations
     let awaRad = (currentAWADeg * Math.PI) / 180;
     let awsKnots = currentTWSRegime; 
     
@@ -240,36 +241,29 @@ module.exports = function (app) {
     let apparentY = awsKnots * Math.sin(awaRad);
     let derivedTWADeg = Math.abs(Math.atan2(apparentY, apparentX) * 180 / Math.PI);
 
-    // Compute unfiltered dynamic VMG
     let twaRad = (derivedTWADeg * Math.PI) / 180;
     let rawVMGKnots = Math.abs(currentSTWKnots * Math.cos(twaRad));
     
-    // Instrument Damping Filter (Prevents immediate zeroing on tacks)
     filteredVMG = filteredVMG + dampingFactor * (rawVMGKnots - filteredVMG);
 
-    // Push calculation metrics directly into Signal K delta framework for Webapp ingestion
     app.handleMessage(plugin.id, {
       updates: [
         {
           values: [
-            { path: 'environment.wind.speedTrue', value: currentTWSRegime / 1.94384 }, // Knots to m/s
-            { path: 'environment.wind.angleTrue', value: (derivedTWADeg * Math.PI) / 180 }, // Deg to Rad
-            { path: 'navigation.speedThroughWater', value: currentSTWKnots / 1.94384 }, // Knots to m/s
+            { path: 'environment.wind.speedTrue', value: currentTWSRegime / 1.94384 },
+            { path: 'environment.wind.angleTrue', value: (derivedTWADeg * Math.PI) / 180 },
+            { path: 'navigation.speedThroughWater', value: currentSTWKnots / 1.94384 },
             { path: 'performance.currentRatio', value: randomVarianceScalar }
           ]
         }
       ]
     });
 
-    // Assembly NMEA 0183 sentences
     let vhwSentence = appendChecksum(`IIVHW,,T,,M,${currentSTWKnots.toFixed(2)},N,,K`);
-    
     let awaFormatted = currentAWADeg < 0 ? 360 + currentAWADeg : currentAWADeg;
     let mwvApparentSentence = appendChecksum(`IIMWV,${awaFormatted.toFixed(1)},R,${awsKnots.toFixed(1)},N,A`);
-
     let twaFormatted = currentAWADeg < 0 ? 360 - derivedTWADeg : derivedTWADeg;
     let mwvTrueSentence = appendChecksum(`IIMWV,${twaFormatted.toFixed(1)},T,${currentTWSRegime.toFixed(1)},N,A`);
-    
     let vmgSentence = appendChecksum(`IIVMG,${filteredVMG.toFixed(2)},N,,`);
     let rsaSentence = appendChecksum(`IIRSA,${currentRudderDeg.toFixed(1)},A,,`);
 
