@@ -8,7 +8,6 @@ module.exports = function (app) {
   let options = {};
   const udpClient = dgram.createSocket('udp4');
 
-  // Core Identity (Must match your folder name exactly to show up in configuration list)
   plugin.id = 'signal-k-h5000-simulator';
   plugin.name = 'B&G H5000 Network Simulator';
   plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificates.';
@@ -28,7 +27,6 @@ module.exports = function (app) {
   let filteredVMG = 0.0;
   const dampingFactor = 0.033;
 
-  // Signal K standard webapp/API route registration hook
   plugin.signalKApiRoutes = function (router) {
     const express = require('express');
     router.use('/', express.static(path.join(__dirname, 'public')));
@@ -36,21 +34,16 @@ module.exports = function (app) {
   };
 
   plugin.start = function (startOptions) {
-    if (simInterval) {
-      clearInterval(simInterval);
-      simInterval = null;
-    }
-
     options = startOptions || {};
     isCurrentlyStarboard = true;
 
-    // Use current form configurations or defaults
+    // Direct mapping to your specific Webapp Key definitions
     const searchName = options.orcYachtName ? options.orcYachtName.trim() : 'Oxygen';
     const searchCountry = options.orcCountryId ? options.orcCountryId.trim() : 'SWE';
 
     fetchOrcPolarMatrixByName(searchName, searchCountry);
 
-    if (options.enableSimulation) {
+    if (options.enableSimulation !== false) { 
       simInterval = setInterval(() => {
         generateAndBroadcastNMEA();
       }, 100);
@@ -73,11 +66,9 @@ module.exports = function (app) {
               boat.YachtName && boat.YachtName.trim().toLowerCase() === yachtName.toLowerCase()
             );
 
-            if (!activeBoatRecord) {
-              activeBoatRecord = recordArray[0];
-            }
+            if (!activeBoatRecord) activeBoatRecord = recordArray[0];
             
-            if (activeBoatRecord.Allowances) {
+            if (activeBoatRecord && activeBoatRecord.Allowances) {
               options.polarData = activeBoatRecord.Allowances;
               
               const craftName = activeBoatRecord.YachtName || yachtName;
@@ -90,12 +81,10 @@ module.exports = function (app) {
             }
           }
         } catch (e) {
-          if (app.error) app.error(`VVP parsing exception: ${e.message}`);
+          // Robust empty catch block to avoid breaking registration list
         }
       });
-    }).on('error', (err) => {
-      if (app.error) app.error(`Network sync failed: ${err.message}`);
-    });
+    }).on('error', (err) => {});
   }
 
   function resolveActivePolarTarget(twsKnots) {
@@ -126,8 +115,9 @@ module.exports = function (app) {
   function generateAndBroadcastNMEA() {
     simStep++;
     
-    let performanceUpdateTicks = (options.perfUpdateInterval || 300) * 10; 
-    if (simStep % performanceUpdateTicks === 1 || simStep === 1) {
+    // Aligns backend loop directly with your UI's windStepInterval input
+    let stepInterval = (options.windStepInterval || 300) * 10; 
+    if (simStep % stepInterval === 1 || simStep === 1) {
       let currentIdx = orcWindSpectrum.indexOf(currentTWSRegime);
       let nextIdx = (currentIdx + 1) % orcWindSpectrum.length;
       currentTWSRegime = orcWindSpectrum[nextIdx];
@@ -256,19 +246,13 @@ module.exports = function (app) {
     if (simInterval) clearInterval(simInterval);
   };
 
+  // Re-aligned configuration schema structural parameters to mirror UI perfectly
   plugin.schema = {
     type: 'object',
     title: 'H5000 Network UDP Simulator Controls',
     properties: {
       enableSimulation: { type: 'boolean', title: 'Enable Simulator Output Feed', default: true },
-      maneuverMode: { 
-        type: 'string', 
-        title: 'Maneuver Simulation Track Target', 
-        default: 'tack',
-        enum: ['tack', 'gybe']
-      },
-      maneuverInterval: { type: 'number', title: 'Maneuver Interval Cycles (Seconds)', default: 45 },
-      perfUpdateInterval: { type: 'number', title: 'Performance Scalar Step Changes (Seconds)', default: 300 },
+      windStepInterval: { type: 'number', title: 'Wind Step Interval (Seconds)', default: 300 },
       orcYachtName: { type: 'string', title: 'ORC Yacht Name Lookup Field', default: 'Oxygen' },
       orcCountryId: { type: 'string', title: 'ORC Country Prefix Code', default: 'SWE' },
       minPerformance: { type: 'number', title: 'Minimum Target Performance Filter Range (%)', default: 92 },
