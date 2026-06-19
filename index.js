@@ -9,7 +9,7 @@ module.exports = function (app) {
 
   plugin.id = 'signal-k-h5000-simulator';
   plugin.name = 'B&G H5000 Network Simulator (Dynamic ORC Registry)';
-  plugin.description = 'Dynamically pulls official country lists and active certificates straight into dropdown menus to broadcast simulated high-frequency instrument streams.';
+  plugin.description = 'Fetches real-time fleet polar matrices from the ORC registry based on your country code and populates an interactive boat selection list.';
 
   let simStep = 0;
   let isCurrentlyStarboard = true;
@@ -26,8 +26,6 @@ module.exports = function (app) {
   let filteredVMG = 0.0;
   const dampingFactor = 0.033; // ~3-second damping window at 10Hz
 
-  // In-memory cache for available dropdown lists
-  let cachedCountries = ['SWE', 'USA', 'GBR', 'GER', 'FRA', 'ITA', 'ESP', 'NOR', 'DEN', 'FIN'];
   let cachedBoatsForSelectedCountry = [];
 
   plugin.start = function (startOptions) {
@@ -39,7 +37,7 @@ module.exports = function (app) {
     options = startOptions || {};
     isCurrentlyStarboard = true;
 
-    // Trigger asynchronous fetch of live data immediately to lock performance matrix parameters
+    // Load polar values for the chosen boat right away
     refreshActivePolarPayload();
 
     if (options.enableSimulation) {
@@ -49,57 +47,37 @@ module.exports = function (app) {
     }
   };
 
-  // Helper logic to quickly parse raw ORC index records from XML elements without needing npm modules
-  function quickParseXMLCountries(xmlText) {
-    const countries = [];
-    const regex = /<Country\s+Id="([^"]+)"/g;
-    let match;
-    while ((match = regex.exec(xmlText)) !== null) {
-      if (!countries.includes(match[1])) {
-        countries.push(match[1]);
-      }
-    }
-    return countries.length > 0 ? countries.sort() : cachedCountries;
-  }
-
-  // Signal K lifecycle hook to dynamically build configuration forms in the dashboard UI
+  // Signal K lifecycle hook to populate the configuration schema dynamically
   plugin.configureSchema = async function () {
+    const targetCountry = (options.orcCountryId || 'SWE').trim().toUpperCase();
+
     try {
-      // 1. Fetch live Master Country listing from ORC server root endpoint
-      const rawXml = await makeHttpRequest('https://data.orc.org/public/WPub.dll');
-      cachedCountries = quickParseXMLCountries(rawXml);
+      // Fetch all boats registered under the chosen country prefix
+      const url = `https://data.orc.org/public/WPub.dll?action=DownRMS&CountryId=${targetCountry}&Family=ORC&ext=json`;
+      app.debug(`Simulator downloading fleet registry for country: ${targetCountry}`);
+      
+      const rawJson = await makeHttpRequest(url);
+      const data = JSON.parse(rawJson);
+      const records = data && data.rms ? data.rms : [];
+      
+      cachedBoatsForSelectedCountry = records.map(boat => ({
+        id: boat.RefNo || boat.YachtName,
+        title: `${boat.YachtName || 'Unknown'} [${boat.SailNo || 'No Sail ID'}]`
+      })).sort((a, b) => a.title.localeCompare(b.title));
+
     } catch (e) {
-      app.debug(`Using fallback country menu templates due to routing error: ${e.message}`);
+      app.debug(`Could not sync ORC fleet registry for ${targetCountry}: ${e.message}`);
     }
 
-    // 2. If a specific country is actively selected, proactively populate the Yacht lists
-    if (options.orcCountryId) {
-      try {
-        const url = `https://data.orc.org/public/WPub.dll?action=DownRMS&CountryId=${options.orcCountryId}&Family=ORC&ext=json`;
-        const rawJson = await makeHttpRequest(url);
-        const data = JSON.parse(rawJson);
-        const records = data && data.rms ? data.rms : [];
-        
-        cachedBoatsForSelectedCountry = records.map(boat => ({
-          id: boat.RefNo || boat.YachtName,
-          title: `${boat.YachtName} [${boat.SailNo || 'No Sail ID'}]`
-        })).sort((a, b) => a.title.localeCompare(b.title));
-      } catch (e) {
-        app.debug(`Error pulling regional structural vessel maps: ${e.message}`);
-      }
-    }
-
-    // Rebuild and update presentation schema mapping
-    plugin.schema.properties.orcCountryId.enum = cachedCountries;
-    plugin.schema.properties.orcCountryId.enumNames = cachedCountries;
-
+    // Map the fetched boats straight into the configuration dropdown schema
     if (cachedBoatsForSelectedCountry.length > 0) {
       plugin.schema.properties.orcSelectedVesselToken.enum = cachedBoatsForSelectedCountry.map(b => b.id);
       plugin.schema.properties.orcSelectedVesselToken.enumNames = cachedBoatsForSelectedCountry.map(b => b.title);
-      plugin.schema.properties.orcSelectedVesselToken.description = `Found ${cachedBoatsForSelectedCountry.length} active certificates registered for ${options.orcCountryId}`;
+      plugin.schema.properties.orcSelectedVesselToken.description = `Successfully loaded ${cachedBoatsForSelectedCountry.length} active certificates for country group: ${targetCountry}`;
     } else {
       plugin.schema.properties.orcSelectedVesselToken.enum = ['None'];
-      plugin.schema.properties.orcSelectedVesselToken.enumNames = ['Select a Country first to load fleet registry...'];
+      plugin.schema.properties.orcSelectedVesselToken.enumNames = [`No active certificates found for country "${targetCountry}"`];
+      plugin.schema.properties.orcSelectedVesselToken.description = `Try clicking 'Save Configuration' after entering a valid 3-letter country code.`;
     }
 
     return plugin.schema;
@@ -108,7 +86,6 @@ module.exports = function (app) {
   function refreshActivePolarPayload() {
     if (!options.orcSelectedVesselToken || options.orcSelectedVesselToken === 'None') return;
 
-    // Query targeted performance array profiles by verified token reference ID
     const url = `https://data.orc.org/public/WPub.dll?action=DownBoatRMS&RefNo=${encodeURIComponent(options.orcSelectedVesselToken)}&ext=json`;
     
     https.get(url, (res) => {
@@ -123,13 +100,13 @@ module.exports = function (app) {
             verifiedVesselName = `${records[0].YachtName || 'Unknown'} (${records[0].SailNo || ''})`;
             verifiedCertRef = records[0].RefNo || options.orcSelectedVesselToken;
             resolveActivePolarTarget(currentTWSRegime);
-            app.debug(`[ORC Dynamic Sync Lock] Active Vessel: ${verifiedVesselName}`);
+            app.debug(`[ORC Sync Complete] Target Matrix Locked for: ${verifiedVesselName}`);
           }
         } catch (e) {
-          app.error(`Failed parsing target polar data: ${e.message}`);
+          app.error(`Failed parsing target polar data from registry: ${e.message}`);
         }
       });
-    }).on('error', (err) => app.error(`Network pipeline block: ${err.message}`));
+    }).on('error', (err) => app.error(`Network communication error: ${err.message}`));
   }
 
   function makeHttpRequest(url) {
@@ -296,17 +273,16 @@ module.exports = function (app) {
       perfUpdateInterval: { type: 'number', title: 'Wind Step Interval (Seconds)', default: 10 },
       orcCountryId: { 
         type: 'string', 
-        title: '1. Select Country Group', 
+        title: '1. Country Prefix Code (3-Letters)', 
         default: 'SWE',
-        enum: ['SWE'],
-        enumNames: ['SWE']
+        description: 'Type a country code (e.g. SWE, USA, GBR, GER, FRA) and hit Save to load its boats.'
       },
       orcSelectedVesselToken: { 
         type: 'string', 
         title: '2. Select Active Certificate Profile', 
         default: 'None',
         enum: ['None'],
-        enumNames: ['Select a Country first to load fleet registry...']
+        enumNames: ['Type a country prefix and save to pull fleet records...']
       },
       minPerformance: { type: 'number', title: 'Min Performance (%)', default: 92 },
       maxPerformance: { type: 'number', title: 'Max Performance (%)', default: 98 }
