@@ -1,15 +1,10 @@
 {
   "name": "signal-k-h5000-simulator",
   "version": "1.0.0",
-  "description": "B&G H5000 Network Simulator",
   "main": "index.js",
-  "keywords": [
-    "signalk-node-plugin",
-    "signalk-webapp"
-  ],
   "signalk": {
-    "appConnectionId": "signal-k-h5000-simulator",
-    "displayName": "B&G H5000 Matrix Display",
+    "type": "plugin",
+    "displayName": "B&G H5000 Network Simulator",
     "webapp": "public"
   },
   "dependencies": {}
