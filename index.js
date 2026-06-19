@@ -14,7 +14,7 @@ module.exports = function (app) {
   let isCurrentlyStarboard = true;
   let verifiedVesselName = 'None - Waiting for valid API sync...';
 
-  // Base internal fallbacks
+  // Base internal fallbacks (Will be overwritten upon successful ORC sync)
   let orcTargetSTW = 7.80;   
   let orcTargetAngle = 32.0; 
   let randomVarianceScalar = 0.95; 
@@ -40,20 +40,19 @@ module.exports = function (app) {
   };
 
   async function fetchOrcPolarMatrix(inputString) {
-    const matchMatch = inputString.trim().toUpperCase().match(/(?:CC\/)?([A-Za-z0-9]+)$/);
-    const certId = matchMatch ? matchMatch[1] : null;
-
+    const certId = inputString.trim();
     if (!certId) {
-      app.error(`Simulator could not isolate a valid ORC reference key from input: "${inputString}"`);
+      app.error(`Simulator received an empty ORC reference identifier link.`);
       return;
     }
 
-    const url = `https://data.orc.org/public/WPub.dll?action=DownBoatRMS&RefNo=${certId}&ext=json`;
+    // Fixed API URL generation passing the clean string directly
+    const url = `https://data.orc.org/public/WPub.dll?action=DownBoatRMS&RefNo=${encodeURIComponent(certId)}&ext=json`;
     
     try {
       app.debug(`Simulator querying live official ORC endpoint: ${url}`);
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 6000);
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
       
       const response = await fetch(url, { signal: controller.signal });
       clearTimeout(timeoutId);
@@ -62,28 +61,43 @@ module.exports = function (app) {
       
       const data = await response.json();
       
-      if (data && Array.isArray(data.rms) && data.rms.length > 0) {
-        const activeBoatRecord = data.rms[0];
+      // Normalize layout differences across different ORC database structural versions
+      let recordArray = null;
+      if (Array.isArray(data)) {
+        recordArray = data;
+      } else if (data && Array.isArray(data.rms)) {
+        recordArray = data.rms;
+      } else if (data && typeof data === 'object') {
+        recordArray = [data]; // Wrap singular response object
+      }
+
+      if (recordArray && recordArray.length > 0) {
+        const activeBoatRecord = recordArray[0];
         
-        if (activeBoatRecord.vpp) {
-          options.polarData = activeBoatRecord.vpp;
+        // Extract the VPP block from either root level or nested parameters
+        const vppBlock = activeBoatRecord.vpp || activeBoatRecord;
+        
+        if (vppBlock && (vppBlock.vmgDownwind || vppBlock.vmgUpwind || vppBlock.lengths)) {
+          options.polarData = vppBlock;
           
-          if (activeBoatRecord.YachtName) {
-            verifiedVesselName = `${activeBoatRecord.YachtName} (${activeBoatRecord.SailNo || 'No Sail Number'})`;
-            plugin.schema.properties.lastVerifiedVessel.default = verifiedVesselName;
-            
-            if (options.lastVerifiedVessel !== verifiedVesselName) {
-              options.lastVerifiedVessel = verifiedVesselName;
-              app.savePluginOptions(options, () => {
-                app.debug(`[ORC Config UI Sync] Configuration metadata updated with vessel name: ${verifiedVesselName}`);
-              });
-            }
+          // Match standard name parameters from the ORC database schema
+          const craftName = activeBoatRecord.YachtName || activeBoatRecord.yachtName || activeBoatRecord.name || 'Parsed Vessel';
+          const sailNum = activeBoatRecord.SailNo || activeBoatRecord.sailNo || '';
+          
+          verifiedVesselName = sailNum ? `${craftName} (${sailNum})` : craftName;
+          plugin.schema.properties.lastVerifiedVessel.default = verifiedVesselName;
+          
+          if (options.lastVerifiedVessel !== verifiedVesselName) {
+            options.lastVerifiedVessel = verifiedVesselName;
+            app.savePluginOptions(options, () => {
+              app.debug(`[ORC Config UI Sync] Configuration metadata updated with vessel name: ${verifiedVesselName}`);
+            });
           }
 
           app.debug(`[ORC Engine Init] Successfully bound VPP polar matrices for boat reference: ${certId}`);
           resolveActivePolarTarget(14.0); 
         } else {
-          app.error(`Matched record for ${certId}, but the object is missing its 'vpp' performance metrics block.`);
+          app.error(`Matched record for ${certId}, but the parsed object is missing standard VPP matrix data structural points.`);
         }
       } else {
         app.error(`No active certification criteria matched on the database server for Reference Number: ${certId}`);
@@ -98,21 +112,32 @@ module.exports = function (app) {
     try {
       const vpp = options.polarData;
       const isGybeMode = options.maneuverMode === 'gybe';
-      const targetArray = isGybeMode ? vpp.vmgDownwind : vpp.vmgUpwind;
+      
+      // Look for the target data array inside the standard ORC object fields
+      let targetArray = isGybeMode ? vpp.vmgDownwind : vpp.vmgUpwind;
       
       if (targetArray && Array.isArray(targetArray)) {
-        let match = targetArray.find(item => twsKnots <= item.tws);
+        let match = targetArray.find(item => twsKnots <= (item.tws || item.TWS || 0));
         if (!match) match = targetArray[targetArray.length - 1];
         
         if (match) {
           if (isGybeMode) {
-            orcTargetSTW = match.vboat || 7.50;
-            orcTargetAngle = match.downwindAngle || 150.0;
+            orcTargetSTW = match.vboat || match.VBoat || match.speed || 7.50;
+            orcTargetAngle = match.downwindAngle || match.angle || match.twa || 150.0;
           } else {
-            orcTargetSTW = match.vboat || 5.85;
-            orcTargetAngle = match.upwindAngle || 37.8;
+            orcTargetSTW = match.vboat || match.VBoat || match.speed || 5.85;
+            orcTargetAngle = match.upwindAngle || match.angle || match.twa || 37.8;
           }
           app.debug(`[ORC Polar Update] Live Targets -> STW: ${orcTargetSTW.toFixed(2)} kn | Wind Angle: ${orcTargetAngle.toFixed(1)}°`);
+        }
+      } else {
+        // Fallback processing using the image data directly if structured array isn't extracted
+        if (isGybeMode) {
+          orcTargetSTW = 8.71;   // 14kt Downwind polar speed from certificate image
+          orcTargetAngle = 152.0; // 14kt Downwind polar gybe target angle from certificate image
+        } else {
+          orcTargetSTW = 5.85;   // 14kt Upwind polar speed from certificate image
+          orcTargetAngle = 37.8;  // 14kt Upwind polar target angle from certificate image
         }
       }
     } catch (e) {
@@ -137,8 +162,8 @@ module.exports = function (app) {
     let activeTargetSTW = orcTargetSTW;
     
     if (isGybeMode && orcTargetAngle < 90) {
-      activeTargetAngle = 150.0; 
-      activeTargetSTW = 7.50;
+      activeTargetAngle = 152.0; 
+      activeTargetSTW = 8.71;
     } else if (!isGybeMode && orcTargetAngle > 90) {
       activeTargetAngle = 37.8;  
       activeTargetSTW = 5.85;
@@ -271,7 +296,7 @@ module.exports = function (app) {
       },
       maneuverInterval: { type: 'number', title: 'Maneuver Interval Cycles (Seconds)', default: 45 },
       perfUpdateInterval: { type: 'number', title: 'Performance Scalar Step Changes (Seconds)', default: 5 },
-      orcCertRef: { type: 'string', title: 'ORC Certificate ID Reference or URL Link', default: '03200002P4H' },
+      orcCertRef: { type: 'string', title: 'ORC Reference Number (e.g. ESP0003507 or USA52000)', default: '03200002P4H' },
       lastVerifiedVessel: { 
         type: 'string', 
         title: 'Active Verified Vessel Status', 
