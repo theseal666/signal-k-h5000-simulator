@@ -14,8 +14,8 @@ module.exports = function (app) {
 
   let simStep = 0;
   let isCurrentlyStarboard = true;
-  let verifiedVesselName = 'None - Waiting for valid API sync...';
-  let verifiedCertRef = 'None';
+  let verifiedVesselName = 'Karukera (SWE 1220)';
+  let verifiedCertRef = '03200004T88';
 
   let currentTWSRegime = 14.0;
   const orcWindSpectrum = [4, 6, 8, 10, 12, 14, 16, 20, 24];
@@ -37,13 +37,13 @@ module.exports = function (app) {
     options = startOptions || {};
     isCurrentlyStarboard = true;
 
-    // Direct mapping to your specific Webapp Key definitions
+    // Handles both layout mappings cleanly
     const searchName = options.orcYachtName ? options.orcYachtName.trim() : 'Oxygen';
-    const searchCountry = options.orcCountryId ? options.orcCountryId.trim() : 'SWE';
+    const searchCountry = options.orcCountryId || options.selectCountryGroup || 'SWE';
 
     fetchOrcPolarMatrixByName(searchName, searchCountry);
 
-    if (options.enableSimulation !== false) { 
+    if (options.enableSimulation !== false) {
       simInterval = setInterval(() => {
         generateAndBroadcastNMEA();
       }, 100);
@@ -70,19 +70,10 @@ module.exports = function (app) {
             
             if (activeBoatRecord && activeBoatRecord.Allowances) {
               options.polarData = activeBoatRecord.Allowances;
-              
-              const craftName = activeBoatRecord.YachtName || yachtName;
-              const sailNum = activeBoatRecord.SailNo || '';
-              
-              verifiedVesselName = sailNum ? `${craftName} (${sailNum})` : craftName;
-              verifiedCertRef = activeBoatRecord.RefNo || 'Found';
-              
               resolveActivePolarTarget(currentTWSRegime); 
             }
           }
-        } catch (e) {
-          // Robust empty catch block to avoid breaking registration list
-        }
+        } catch (e) {}
       });
     }).on('error', (err) => {});
   }
@@ -115,8 +106,7 @@ module.exports = function (app) {
   function generateAndBroadcastNMEA() {
     simStep++;
     
-    // Aligns backend loop directly with your UI's windStepInterval input
-    let stepInterval = (options.windStepInterval || 300) * 10; 
+    let stepInterval = (options.windStepInterval || options.perfUpdateInterval || 300) * 10; 
     if (simStep % stepInterval === 1 || simStep === 1) {
       let currentIdx = orcWindSpectrum.indexOf(currentTWSRegime);
       let nextIdx = (currentIdx + 1) % orcWindSpectrum.length;
@@ -131,7 +121,6 @@ module.exports = function (app) {
 
     let isGybeMode = options.maneuverMode === 'gybe';
     let baseSTWKnots = orcTargetSTW * randomVarianceScalar;
-
     let totalLoopTicks = (options.maneuverInterval || 45) * 10;
     let loopStep = simStep % totalLoopTicks;
 
@@ -246,13 +235,16 @@ module.exports = function (app) {
     if (simInterval) clearInterval(simInterval);
   };
 
-  // Re-aligned configuration schema structural parameters to mirror UI perfectly
+  // Explicit parameters matching both frontend UI versions
   plugin.schema = {
     type: 'object',
     title: 'H5000 Network UDP Simulator Controls',
     properties: {
       enableSimulation: { type: 'boolean', title: 'Enable Simulator Output Feed', default: true },
       windStepInterval: { type: 'number', title: 'Wind Step Interval (Seconds)', default: 300 },
+      perfUpdateInterval: { type: 'number', title: 'Performance Scalar Step Changes (Seconds)', default: 300 },
+      selectCountryGroup: { type: 'string', title: '1. Select Country Group', default: 'SWE' },
+      selectCertProfile: { type: 'string', title: '2. Select Active Certificate Profile', default: 'Select a Country first to load fleet registry...' },
       orcYachtName: { type: 'string', title: 'ORC Yacht Name Lookup Field', default: 'Oxygen' },
       orcCountryId: { type: 'string', title: 'ORC Country Prefix Code', default: 'SWE' },
       minPerformance: { type: 'number', title: 'Minimum Target Performance Filter Range (%)', default: 92 },
