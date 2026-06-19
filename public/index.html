@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>ORC VPP Performance Live Matrix Tracker</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      background: #121212;
+      color: #e0e0e0;
+      padding: 20px;
+      margin: 0;
+    }
+    h2 { margin-bottom: 5px; color: #fff; }
+    .telemetry-bar {
+      display: flex;
+      gap: 20px;
+      background: #1a1a1a;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      border: 1px solid #333;
+    }
+    .metric { font-size: 14px; color: #aaa; }
+    .metric span { display: block; font-size: 22px; font-weight: bold; color: #00ffff; margin-top: 4px; }
+    
+    .matrix-container {
+      position: relative;
+      display: inline-block;
+      background: #1a1a1a;
+      border-radius: 8px;
+      padding: 15px;
+      border: 1px solid #333;
+    }
+    table {
+      border-collapse: collapse;
+      position: relative;
+    }
+    th, td {
+      width: 75px;
+      height: 40px;
+      text-align: center;
+      border: 1px solid #2d2d2d;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    th { background: #262626; color: #aaa; font-weight: bold; }
+    .row-header { background: #262626; color: #aaa; font-weight: bold; }
+    
+    /* Live Tracking Overlay Dot Configuration */
+    #live-tracker-dot {
+      position: absolute;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background-color: #fff;
+      border: 2px solid #fff;
+      box-shadow: 0 0 12px rgba(255,255,255,0.8);
+      transition: all 0.3s ease;
+      transform: translate(-7px, -7px);
+      z-index: 100;
+      display: none;
+    }
+    
+    /* Performance Color Indicator Legends */
+    .legend { display: flex; gap: 15px; margin-top: 15px; font-size: 12px; }
+    .legend-item { display: flex; align-items: center; gap: 6px; }
+    .dot-sample { width: 12px; height: 12px; border-radius: 50%; }
+  </style>
+</head>
+<body>
+
+  <h2>ORC VPP Performance Live Matrix</h2>
+  <div class="telemetry-bar">
+    <div class="metric">True Wind Speed (TWS) <span id="val-tws">0.0 kn</span></div>
+    <div class="metric">True Wind Angle (TWA) <span id="val-twa">0.0°</span></div>
+    <div class="metric">Speed Through Water <span id="val-stw">0.00 kn</span></div>
+    <div class="metric">Simulated Target Efficiency <span id="val-perf">0.0%</span></div>
+  </div>
+
+  <div class="matrix-container">
+    <div id="live-tracker-dot"></div>
+    
+    <table id="vpp-table">
+      <thead>
+        <tr id="tws-headers">
+          <th>TWA \ TWS</th>
+          </tr>
+      </thead>
+      <tbody id="matrix-body">
+        </tbody>
+    </table>
+  </div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="dot-sample" style="background:#ff3333"></div> &lt; 75% (Poor)</div>
+    <div class="legend-item"><div class="dot-sample" style="background:#ff9900"></div> 75% - 87% (Moderate)</div>
+    <div class="legend-item"><div class="dot-sample" style="background:#ffff00"></div> 88% - 94% (Good)</div>
+    <div class="legend-item"><div class="dot-sample" style="background:#00ff00"></div> &gt;= 95% (Target Optimal)</div>
+  </div>
+
+  <script>
+    // Hardcoded layout baseline extracted from Karukera's actual 2026 ORC certificate schema limits
+    const windSpeeds = [4, 6, 8, 10, 12, 14, 16, 20, 24];
+    const targetAngles = [52, 60, 75, 90, 110, 120, 135, 150];
+    
+    // Time-on-Distance matrix array rows (seconds per mile)
+    const allowances = {
+      52:  [764.5, 562.4, 485.7, 455.7, 444.7, 437.7, 431.8, 424.5, 422.5],
+      60:  [706.6, 533.8, 469.6, 442.5, 430.4, 422.9, 415.8, 406.8, 403.3],
+      75:  [666.9, 514.6, 459.3, 431.2, 410.8, 399.8, 392.6, 379.2, 372.3],
+      90:  [681.3, 520.6, 461.0, 429.2, 405.5, 385.4, 371.2, 354.8, 340.5],
+      110: [756.1, 541.4, 458.5, 419.0, 391.8, 372.3, 351.0, 321.6, 302.0],
+      120: [786.9, 551.5, 461.8, 420.6, 387.5, 360.3, 341.7, 301.3, 269.4],
+      135: [884.1, 616.7, 493.1, 441.4, 406.6, 375.1, 343.3, 280.8, 244.3],
+      150: [1069.7,736.2, 583.4, 494.5, 444.2, 413.3, 385.6, 321.9, 252.0]
+    };
+
+    // Render columns headers
+    const headerRow = document.getElementById('tws-headers');
+    windSpeeds.forEach(tws => {
+      const th = document.createElement('th');
+      th.innerText = tws + ' kt';
+      headerRow.appendChild(th);
+    });
+
+    // Render table data rows converted to boat speeds (3600 / allowance)
+    const tbody = document.getElementById('matrix-body');
+    targetAngles.forEach(angle => {
+      const tr = document.createElement('tr');
+      const rowTh = document.createElement('td');
+      rowTh.className = 'row-header';
+      rowTh.innerText = angle + '°';
+      tr.appendChild(rowTh);
+
+      allowances[angle].forEach((val, idx) => {
+        const td = document.createElement('td');
+        const speedKnots = (3600 / val).toFixed(2);
+        td.innerText = speedKnots;
+        // Assign tracking hooks to search locations
+        td.id = `cell-${angle}-${windSpeeds[idx]}`;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+
+    // Automatically establish Signal K relative streaming links over live WebSockets
+    const wsUrl = `ws://${window.location.host}/signalk/v1/stream?subscribe=none`;
+    const ws = new WebSocket(wsUrl);
+
+    let currentTWS = 0, currentTWA = 0, currentSTW = 0, currentPerfScalar = 1.0;
+
+    ws.onopen = () => {
+      // Subscribe to environmental paths and plugin paths
+      const subscription = {
+        context: "vessels.self",
+        subscribe: [
+          { path: "environment.wind.speedTrue", format: "delta", policy: "instant" },
+          { path: "environment.wind.angleTrue", format: "delta", policy: "instant" },
+          { path: "navigation.speedThroughWater", format: "delta", policy: "instant" },
+          { path: "performance.currentRatio", format: "delta", policy: "instant" }
+        ]
+      };
+      ws.send(JSON.stringify(subscription));
+    };
+
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (!msg.updates) return;
+
+      msg.updates.forEach(update => {
+        if (!update.values) return;
+        update.values.forEach(kv => {
+          if (kv.path === "environment.wind.speedTrue") {
+            currentTWS = kv.value * 1.94384; // convert m/s to knots
+            document.getElementById('val-tws').innerText = currentTWS.toFixed(1) + ' kn';
+          }
+          if (kv.path === "environment.wind.angleTrue") {
+            currentTWA = Math.abs(kv.value * 57.2958); // convert radians to degrees
+            document.getElementById('val-twa').innerText = currentTWA.toFixed(1) + '°';
+          }
+          if (kv.path === "navigation.speedThroughWater") {
+            currentSTW = kv.value * 1.94384; // convert m/s to knots
+            document.getElementById('val-stw').innerText = currentSTW.toFixed(2) + ' kn';
+          }
+          if (kv.path === "performance.currentRatio") {
+            currentPerfScalar = kv.value;
+            document.getElementById('val-perf').innerText = (currentPerfScalar * 100).toFixed(1) + '%';
+          }
+        });
+      });
+
+      updateTrackerDotPosition();
+    };
+
+    function updateTrackerDotPosition() {
+      // 1. Find bounding index constraints across arrays
+      let twsCol = windSpeeds.reduce((prev, curr) => Math.abs(curr - currentTWS) < Math.abs(prev - currentTWS) ? curr : prev);
+      let twaRow = targetAngles.reduce((prev, curr) => Math.abs(curr - currentTWA) < Math.abs(prev - currentTWA) ? curr : prev);
+
+      const targetCell = document.getElementById(`cell-${twaRow}-${twsCol}`);
+      const dot = document.getElementById('live-tracker-dot');
+
+      if (targetCell) {
+        // 2. Position tracking indicator exactly centered inside computed target cell coordinates
+        const cellRect = targetCell.getBoundingClientRect();
+        const containerRect = targetCell.offsetParent.getBoundingClientRect();
+
+        dot.style.left = (targetCell.offsetLeft + (targetCell.offsetWidth / 2)) + 'px';
+        dot.style.top = (targetCell.offsetTop + (targetCell.offsetHeight / 2)) + 'px';
+        dot.style.display = 'block';
+
+        // 3. Dynamic multi-tier coloring logic mapping based on your requirements
+        let perfPct = currentPerfScalar * 100;
+        if (perfPct < 75) {
+          dot.style.backgroundColor = '#ff3333'; // Red
+        } else if (perfPct < 88) {
+          dot.style.backgroundColor = '#ff9900'; // Orange
+        } else if (perfPct < 95) {
+          dot.style.backgroundColor = '#ffff00'; // Yellow
+        } else {
+          dot.style.backgroundColor = '#00ff00'; // Green (Target Optimal!)
+        }
+      }
+    }
+  </script>
+</body>
+</html>
