@@ -11,7 +11,8 @@ module.exports = function (app) {
   plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificate VPP matrices.';
 
   let simStep = 0;
-  
+  let isCurrentlyStarboard = true; // Tracks the starting tack state for the current interval loop
+
   // Base internal fallbacks (Overwritten upon successful API fetch)
   let orcTargetSTW = 7.80;   
   let orcTargetAngle = 32.0; 
@@ -19,6 +20,7 @@ module.exports = function (app) {
 
   plugin.start = function (startOptions) {
     options = startOptions || {};
+    isCurrentlyStarboard = true; // Reset state on startup
 
     if (options.orcCertRef) {
       fetchOrcPolarMatrix(options.orcCertRef);
@@ -84,7 +86,6 @@ module.exports = function (app) {
         if (!match) match = targetArray[targetArray.length - 1];
         
         if (match) {
-          // Explicitly map properties from the ORC database JSON
           if (isGybeMode) {
             orcTargetSTW = match.vboat || 7.50;
             orcTargetAngle = match.downwindAngle || 150.0;
@@ -113,27 +114,36 @@ module.exports = function (app) {
 
     let isGybeMode = options.maneuverMode === 'gybe';
     
-    // Safety Fallback Guard: Enforce true downwind metrics if ORC fetch hasn't overwritten them yet
+    // Safety Fallback Guard
     let activeTargetAngle = orcTargetAngle;
     let activeTargetSTW = orcTargetSTW;
     
     if (isGybeMode && orcTargetAngle < 90) {
-      activeTargetAngle = 150.0; // Force downwind default context
+      activeTargetAngle = 150.0; 
       activeTargetSTW = 7.50;
     } else if (!isGybeMode && orcTargetAngle > 90) {
-      activeTargetAngle = 37.8;  // Force upwind default context
+      activeTargetAngle = 37.8;  
       activeTargetSTW = 5.85;
     }
 
     let baseSTWKnots = activeTargetSTW * randomVarianceScalar;
     let baseAWSKnots = 14.0; 
 
-    let entryAwa = activeTargetAngle;  
-    let exitAwa = -activeTargetAngle; 
-    let dynamicOvershootAwa = isGybeMode ? -(activeTargetAngle - 10) : -(activeTargetAngle + 10); 
-
     let totalLoopTicks = (options.maneuverInterval || 45) * 10;
     let loopStep = simStep % totalLoopTicks;
+
+    // Flip-flop the tack orientation flag cleanly at the precise boundary reset tick
+    if (loopStep === 0 && simStep > 1) {
+      isCurrentlyStarboard = !isCurrentlyStarboard;
+      app.debug(`[Simulation Clock Reset] Swapping active tracking orientation. New starting board: ${isCurrentlyStarboard ? 'Starboard' : 'Port'}`);
+    }
+
+    // Direction scalar modifier: 1 if maneuvering from STBD -> PORT, -1 if PORT -> STBD
+    let side = isCurrentlyStarboard ? 1 : -1;
+
+    let entryAwa = activeTargetAngle * side;  
+    let exitAwa = -activeTargetAngle * side; 
+    let dynamicOvershootAwa = isGybeMode ? -((activeTargetAngle - 10) * side) : -((activeTargetAngle + 10) * side); 
 
     let currentSTWKnots = baseSTWKnots;
     let currentAWADeg = entryAwa;
@@ -141,30 +151,39 @@ module.exports = function (app) {
 
     // --- Dynamic Sailing Physics Engine Execution Loop ---
     if (isGybeMode) {
-      // DOWNWIND GYBE LOGIC (Sweeps continuously through 180 degrees)
+      // DOWNWIND TWIN-AXIS CONTINUOUS GYBING LOOPS
       if (loopStep >= 0 && loopStep < 30) {
         let progress = loopStep / 30;
-        currentRudderDeg = -5 * progress; 
-        currentAWADeg = entryAwa + ((180 - entryAwa) * progress); // 150 -> 180
+        currentRudderDeg = -5 * side * progress; 
+        
+        let targetBoundary = 180 * side; // Sweeping toward 180 or -180
+        currentAWADeg = entryAwa + ((targetBoundary - entryAwa) * progress);
         currentSTWKnots = baseSTWKnots - ((baseSTWKnots * 0.10) * progress);
       }
       else if (loopStep >= 30 && loopStep < 70) {
         let progress = (loopStep - 30) / 40;
-        currentRudderDeg = -12; // Catch the stern swing as the boom jibes
+        currentRudderDeg = -12 * side; 
         
-        // Target tracking continues smoothly past 180 (e.g., 180 -> 210)
-        let endAngleUnwrapped = dynamicOvershootAwa < 0 ? dynamicOvershootAwa + 360 : dynamicOvershootAwa;
-        let rawSweep = 180 + ((endAngleUnwrapped - 180) * progress);
+        let startAngle = 180 * side;
+        let targetEndUnwrapped = dynamicOvershootAwa;
         
-        // Wrap back to Signal K standard signed coordinate space (-180 to +180)
-        currentAWADeg = rawSweep > 180 ? rawSweep - 360 : rawSweep;
+        // Correct the unwrap logic to support both directions crossing the 180 split line
+        if (side === 1 && targetEndUnwrapped < 0) targetEndUnwrapped += 360;
+        if (side === -1 && targetEndUnwrapped > 0) targetEndUnwrapped -= 360;
+        
+        let rawSweep = startAngle + ((targetEndUnwrapped - startAngle) * progress);
+        
+        // Normalize coordinates back safely inside -180 to 180 bounds
+        if (rawSweep > 180) currentAWADeg = rawSweep - 360;
+        else if (rawSweep < -180) currentAWADeg = rawSweep + 360;
+        else currentAWADeg = rawSweep;
         
         let maxSpeedDrop = baseSTWKnots * 0.25;
         currentSTWKnots = (baseSTWKnots * 0.90) - (maxSpeedDrop * Math.sin(progress * Math.PI / 2));
       }
       else if (loopStep >= 70 && loopStep < 170) {
         let progress = (loopStep - 70) / 100;
-        currentRudderDeg = 4 * (1 - progress); 
+        currentRudderDeg = 4 * side * (1 - progress); 
         currentAWADeg = dynamicOvershootAwa + ((exitAwa - dynamicOvershootAwa) * Math.pow(progress, 2));
         
         let lowestSpeed = baseSTWKnots * 0.65;
@@ -176,23 +195,23 @@ module.exports = function (app) {
         currentSTWKnots = baseSTWKnots;
       }
     } else {
-      // UPWIND TACKING LOGIC (Crosses through 0 degrees)
+      // UPWIND TWIN-AXIS CONTINUOUS TACKING LOOPS
       if (loopStep >= 0 && loopStep < 30) {
         let progress = loopStep / 30;
-        currentRudderDeg = 6 * progress;
+        currentRudderDeg = 6 * side * progress;
         currentAWADeg = entryAwa + ((0 - entryAwa) * progress);
         currentSTWKnots = baseSTWKnots - ((baseSTWKnots * 0.15) * progress);
       }
       else if (loopStep >= 30 && loopStep < 70) {
         let progress = (loopStep - 30) / 40;
-        currentRudderDeg = 10;
+        currentRudderDeg = 10 * side;
         currentAWADeg = 0 + ((dynamicOvershootAwa - 0) * progress);
         let maxSpeedDrop = baseSTWKnots * 0.45;
         currentSTWKnots = (baseSTWKnots * 0.85) - (maxSpeedDrop * Math.sin(progress * Math.PI / 2));
       }
       else if (loopStep >= 70 && loopStep < 170) {
         let progress = (loopStep - 70) / 100;
-        currentRudderDeg = -2 * (1 - progress);
+        currentRudderDeg = -2 * side * (1 - progress);
         currentAWADeg = dynamicOvershootAwa + ((exitAwa - dynamicOvershootAwa) * Math.pow(progress, 2));
         let lowestSpeed = baseSTWKnots * 0.40;
         currentSTWKnots = lowestSpeed + ((baseSTWKnots - lowestSpeed) * Math.sqrt(progress));
