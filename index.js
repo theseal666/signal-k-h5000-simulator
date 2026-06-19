@@ -12,7 +12,7 @@ module.exports = function (app) {
 
   let simStep = 0;
   
-  // Runtime internal targets (dynamically overwritten on successful API fetch)
+  // Base internal fallbacks (Overwritten upon successful API fetch)
   let orcTargetSTW = 7.80;   
   let orcTargetAngle = 32.0; 
   let randomVarianceScalar = 0.95; 
@@ -32,7 +32,6 @@ module.exports = function (app) {
   };
 
   async function fetchOrcPolarMatrix(inputString) {
-    // Force uppercase immediately to satisfy strict database index lookups
     const matchMatch = inputString.trim().toUpperCase().match(/(?:CC\/)?([A-Za-z0-9]+)$/);
     const certId = matchMatch ? matchMatch[1] : null;
 
@@ -85,8 +84,14 @@ module.exports = function (app) {
         if (!match) match = targetArray[targetArray.length - 1];
         
         if (match) {
-          orcTargetSTW = match.vboat || orcTargetSTW;
-          orcTargetAngle = isGybeMode ? (match.downwindAngle || 152.0) : (match.upwindAngle || 37.8);
+          // Explicitly map properties from the ORC database JSON
+          if (isGybeMode) {
+            orcTargetSTW = match.vboat || 7.50;
+            orcTargetAngle = match.downwindAngle || 150.0;
+          } else {
+            orcTargetSTW = match.vboat || 5.85;
+            orcTargetAngle = match.upwindAngle || 37.8;
+          }
           app.debug(`[ORC Polar Update] Live Targets -> STW: ${orcTargetSTW.toFixed(2)} kn | Wind Angle: ${orcTargetAngle.toFixed(1)}°`);
         }
       }
@@ -107,13 +112,25 @@ module.exports = function (app) {
     }
 
     let isGybeMode = options.maneuverMode === 'gybe';
-    let baseSTWKnots = orcTargetSTW * randomVarianceScalar;
+    
+    // Safety Fallback Guard: Enforce true downwind metrics if ORC fetch hasn't overwritten them yet
+    let activeTargetAngle = orcTargetAngle;
+    let activeTargetSTW = orcTargetSTW;
+    
+    if (isGybeMode && orcTargetAngle < 90) {
+      activeTargetAngle = 150.0; // Force downwind default context
+      activeTargetSTW = 7.50;
+    } else if (!isGybeMode && orcTargetAngle > 90) {
+      activeTargetAngle = 37.8;  // Force upwind default context
+      activeTargetSTW = 5.85;
+    }
+
+    let baseSTWKnots = activeTargetSTW * randomVarianceScalar;
     let baseAWSKnots = 14.0; 
 
-    // Absolute targets handling signs explicitly
-    let entryAwa = orcTargetAngle;  
-    let exitAwa = -orcTargetAngle; 
-    let dynamicOvershootAwa = isGybeMode ? -(orcTargetAngle - 10) : -(orcTargetAngle + 10); 
+    let entryAwa = activeTargetAngle;  
+    let exitAwa = -activeTargetAngle; 
+    let dynamicOvershootAwa = isGybeMode ? -(activeTargetAngle - 10) : -(activeTargetAngle + 10); 
 
     let totalLoopTicks = (options.maneuverInterval || 45) * 10;
     let loopStep = simStep % totalLoopTicks;
@@ -127,26 +144,27 @@ module.exports = function (app) {
       // DOWNWIND GYBE LOGIC (Sweeps continuously through 180 degrees)
       if (loopStep >= 0 && loopStep < 30) {
         let progress = loopStep / 30;
-        currentRudderDeg = -6 * progress; // Mild initiation turn
-        currentAWADeg = entryAwa + ((180 - entryAwa) * progress);
+        currentRudderDeg = -5 * progress; 
+        currentAWADeg = entryAwa + ((180 - entryAwa) * progress); // 150 -> 180
         currentSTWKnots = baseSTWKnots - ((baseSTWKnots * 0.10) * progress);
       }
       else if (loopStep >= 30 && loopStep < 70) {
         let progress = (loopStep - 30) / 40;
-        currentRudderDeg = -10; // Catch the back-side of the gybe
+        currentRudderDeg = -12; // Catch the stern swing as the boom jibes
         
-        // Sweep past 180 into negative apparent wind angles cleanly
-        let startAngle = 180;
-        let endAngle = dynamicOvershootAwa < 0 ? dynamicOvershootAwa + 360 : dynamicOvershootAwa;
-        let sweep = startAngle + ((endAngle - startAngle) * progress);
-        currentAWADeg = sweep > 180 ? sweep - 360 : sweep;
+        // Target tracking continues smoothly past 180 (e.g., 180 -> 210)
+        let endAngleUnwrapped = dynamicOvershootAwa < 0 ? dynamicOvershootAwa + 360 : dynamicOvershootAwa;
+        let rawSweep = 180 + ((endAngleUnwrapped - 180) * progress);
+        
+        // Wrap back to Signal K standard signed coordinate space (-180 to +180)
+        currentAWADeg = rawSweep > 180 ? rawSweep - 360 : rawSweep;
         
         let maxSpeedDrop = baseSTWKnots * 0.25;
         currentSTWKnots = (baseSTWKnots * 0.90) - (maxSpeedDrop * Math.sin(progress * Math.PI / 2));
       }
       else if (loopStep >= 70 && loopStep < 170) {
         let progress = (loopStep - 70) / 100;
-        currentRudderDeg = 4 * (1 - progress); // Counter-steer to settle down
+        currentRudderDeg = 4 * (1 - progress); 
         currentAWADeg = dynamicOvershootAwa + ((exitAwa - dynamicOvershootAwa) * Math.pow(progress, 2));
         
         let lowestSpeed = baseSTWKnots * 0.65;
