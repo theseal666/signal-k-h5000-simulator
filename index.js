@@ -8,7 +8,7 @@ module.exports = function (app) {
 
   plugin.id = 'signal-k-h5000-simulator';
   plugin.name = 'B&G H5000 Network Simulator (UDP Sentences)';
-  plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificate VPP matrices.';
+  plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificate VPP matrices including derived VMG, TWA, and TWS calculations.';
 
   let simStep = 0;
   let isCurrentlyStarboard = true;
@@ -62,7 +62,6 @@ module.exports = function (app) {
       if (recordArray.length > 0) {
         const activeBoatRecord = recordArray[0];
         
-        // Grab the explicit nested database target map
         if (activeBoatRecord.Allowances) {
           options.polarData = activeBoatRecord.Allowances;
           
@@ -72,7 +71,6 @@ module.exports = function (app) {
           verifiedVesselName = sailNum ? `${craftName} (${sailNum})` : craftName;
           plugin.schema.properties.lastVerifiedVessel.default = verifiedVesselName;
           
-          // Capture and bind the explicit 2026 reference verification token back to the user config screen
           verifiedCertRef = activeBoatRecord.RefNo || 'Found';
           plugin.schema.properties.lastVerifiedCert.default = verifiedCertRef;
           
@@ -102,13 +100,11 @@ module.exports = function (app) {
       const allowances = options.polarData;
       const isGybeMode = options.maneuverMode === 'gybe';
       
-      // Map out target column indices matching target Wind Speeds array indices
       const windSpeeds = allowances.WindSpeeds || [4, 6, 8, 10, 12, 14, 16, 20, 24];
       let targetIdx = windSpeeds.indexOf(twsKnots);
-      if (targetIdx === -1) targetIdx = 5; // Default index boundary for 14 knots
+      if (targetIdx === -1) targetIdx = 5; 
 
       if (!isGybeMode) {
-        // Parse Upwind targets using Beat angles and Beat Time-on-Distance array parameters
         const beatAngles = allowances.BeatAngle || [46, 43, 40.5, 38.8, 37.8, 37.8, 37.4, 37.3, 38.1];
         const beatSecondsPerMile = allowances.Beat || [1200.2, 855.1, 713.4, 654.3, 631.4, 615.5, 605.5, 595.9, 599.2];
         
@@ -116,7 +112,6 @@ module.exports = function (app) {
         const allowanceValue = beatSecondsPerMile[targetIdx] || 615.5;
         orcTargetSTW = 3600 / allowanceValue;
       } else {
-        // Parse Downwind targets using Gybe angles and Run Time-on-Distance array parameters
         const gybeAngles = allowances.GybeAngle || [139.2, 142.1, 145.6, 148.2, 152.8, 152.0, 150.1, 144.8, 144.4];
         const runSecondsPerMile = allowances.Run || [1235.2, 850.1, 673.7, 571.0, 510.4, 476.4, 445.2, 371.7, 291.0];
         
@@ -146,7 +141,6 @@ module.exports = function (app) {
     let activeTargetAngle = orcTargetAngle;
     let activeTargetSTW = orcTargetSTW;
 
-    // Safety handling boundaries
     if (isGybeMode && orcTargetAngle < 90) {
       activeTargetAngle = 152.0; 
       activeTargetSTW = 7.55;
@@ -156,7 +150,10 @@ module.exports = function (app) {
     }
 
     let baseSTWKnots = activeTargetSTW * randomVarianceScalar;
-    let baseAWSKnots = 14.0; 
+    
+    // Derived Environmental Inputs (TWS & TWA Tracking Parameters)
+    let simulatedTWSKnots = 14.0; 
+    let simulatedTWADeg = activeTargetAngle; 
 
     let totalLoopTicks = (options.maneuverInterval || 45) * 10;
     let loopStep = simStep % totalLoopTicks;
@@ -212,6 +209,9 @@ module.exports = function (app) {
         currentAWADeg = exitAwa;
         currentSTWKnots = baseSTWKnots;
       }
+      
+      // Compute tracking dynamic true wind angle shift based on current orientation mapping
+      simulatedTWADeg = Math.abs(currentAWADeg);
     } else {
       if (loopStep >= 0 && loopStep < 30) {
         let progress = loopStep / 30;
@@ -238,20 +238,37 @@ module.exports = function (app) {
         currentAWADeg = exitAwa;
         currentSTWKnots = baseSTWKnots;
       }
+      
+      simulatedTWADeg = Math.abs(currentAWADeg);
     }
 
+    // 1. Math formula calculation for derived Velocity Made Good (VMG)
+    // VMG = BoatSpeed * cos(True Wind Angle converted to radians)
+    let twaRadians = (simulatedTWADeg * Math.PI) / 180;
+    let computedVMGKnots = Math.abs(currentSTWKnots * Math.cos(twaRadians));
+
+    // 2. Generate standard raw performance sentences
     let vhw = `IIVHW,,T,,M,${currentSTWKnots.toFixed(2)},N,,K`;
     let vhwSentence = appendChecksum(vhw);
 
     let awaFormatted = currentAWADeg < 0 ? 360 + currentAWADeg : currentAWADeg;
-    let mwv = `IIMWV,${awaFormatted.toFixed(1)},R,${baseAWSKnots.toFixed(1)},N,A`;
-    let mwvSentence = appendChecksum(mwv);
+    let mwvApparent = `IIMWV,${awaFormatted.toFixed(1)},R,${simulatedTWSKnots.toFixed(1)},N,A`;
+    let mwvApparentSentence = appendChecksum(mwvApparent);
 
     let rudderStr = currentRudderDeg.toFixed(1);
     let rsa = `IIRSA,${rudderStr},A,,`;
     let rsaSentence = appendChecksum(rsa);
 
-    const payload = `${vhwSentence}\r\n${mwvSentence}\r\n${rsaSentence}\r\n`;
+    // 3. Generate Derived H5000 Data Sentences (TWA, TWS, and VMG)
+    let twaFormatted = currentAWADeg < 0 ? 360 - simulatedTWADeg : simulatedTWADeg;
+    let mwvTrue = `IIMWV,${twaFormatted.toFixed(1)},T,${simulatedTWSKnots.toFixed(1)},N,A`;
+    let mwvTrueSentence = appendChecksum(mwvTrue);
+
+    let vmgSentenceText = `IIVMG,${computedVMGKnots.toFixed(2)},N,,`;
+    let vmgSentence = appendChecksum(vmgSentenceText);
+
+    // Combine payload and push out to UDP
+    const payload = `${vhwSentence}\r\n${mwvApparentSentence}\r\n${mwvTrueSentence}\r\n${vmgSentence}\r\n${rsaSentence}\r\n`;
     udpClient.send(payload, 2222, '127.0.0.1');
   }
 
