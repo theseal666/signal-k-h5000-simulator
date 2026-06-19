@@ -15,7 +15,7 @@ module.exports = function (app) {
   let verifiedVesselName = 'None - Waiting for valid API sync...';
   let verifiedCertRef = 'None';
 
-  // Base internal fallbacks (Calculated from Karukera's 14kt target benchmarks)
+  // Active runtime targets (will overwrite dynamically upon API load)
   let orcTargetSTW = 5.85;   
   let orcTargetAngle = 37.8; 
   let randomVarianceScalar = 0.95; 
@@ -33,16 +33,19 @@ module.exports = function (app) {
       plugin.schema.properties.lastVerifiedCert.default = verifiedCertRef;
     }
 
-    const searchName = options.orcYachtName ? options.orcYachtName.trim() : '';
-    const searchCountry = options.orcCountryId ? options.orcCountryId.trim() : '';
+    const searchName = options.orcYachtName ? options.orcYachtName.trim() : 'Karukera';
+    const searchCountry = options.orcCountryId ? options.orcCountryId.trim() : 'SWE';
 
-    if (searchName && searchCountry) {
-      fetchOrcPolarMatrixByName(searchName, searchCountry);
+    fetchOrcPolarMatrixByName(searchName, searchCountry);
+
+    if (options.enableSimulation) {
+      simInterval = setInterval(() => {
+        generateAndBroadcastNMEA();
+      }, 100);
     }
   };
 
   async function fetchOrcPolarMatrixByName(yachtName, countryId) {
-    // URL structured exactly as requested to query using Name and Country
     const url = `https://data.orc.org/public/WPub.dll?action=DownBoatRMS&YachtName=${encodeURIComponent(yachtName)}&CountryId=${encodeURIComponent(countryId)}&ext=json`;
     
     try {
@@ -58,32 +61,32 @@ module.exports = function (app) {
 
       if (recordArray.length > 0) {
         const activeBoatRecord = recordArray[0];
-        const vppBlock = activeBoatRecord.vpp || activeBoatRecord;
         
-        if (vppBlock) {
-          options.polarData = vppBlock;
+        // Grab the explicit nested database target map
+        if (activeBoatRecord.Allowances) {
+          options.polarData = activeBoatRecord.Allowances;
           
-          const craftName = activeBoatRecord.YachtName || activeBoatRecord.yachtName || yachtName;
-          const sailNum = activeBoatRecord.SailNo || activeBoatRecord.sailNo || '';
+          const craftName = activeBoatRecord.YachtName || yachtName;
+          const sailNum = activeBoatRecord.SailNo || '';
           
           verifiedVesselName = sailNum ? `${craftName} (${sailNum})` : craftName;
           plugin.schema.properties.lastVerifiedVessel.default = verifiedVesselName;
           
-          // Capture and verify the certificate reference number from the object response
-          verifiedCertRef = activeBoatRecord.RefNo || activeBoatRecord.refNo || 'Found';
+          // Capture and bind the explicit 2026 reference verification token back to the user config screen
+          verifiedCertRef = activeBoatRecord.RefNo || 'Found';
           plugin.schema.properties.lastVerifiedCert.default = verifiedCertRef;
           
-          // Persist back to configurations schema storage if anything changed
           if (options.lastVerifiedVessel !== verifiedVesselName || options.lastVerifiedCert !== verifiedCertRef) {
             options.lastVerifiedVessel = verifiedVesselName;
             options.lastVerifiedCert = verifiedCertRef;
             app.savePluginOptions(options, () => {
-              app.debug(`[ORC Config UI Sync] Found ${verifiedVesselName} | Cert Verification: ${verifiedCertRef}`);
+              app.debug(`[ORC Sync Verified] Matrix Lock: ${verifiedVesselName} | Cert Token: ${verifiedCertRef}`);
             });
           }
 
-          app.debug(`[ORC Engine Init] Successfully bound VPP polar matrices for boat reference: ${verifiedCertRef}`);
           resolveActivePolarTarget(14.0); 
+        } else {
+          app.error(`Matched record structure, but Allowances data map was absent.`);
         }
       } else {
         app.error(`No active certification criteria matched on the database server for: ${yachtName} (${countryId})`);
@@ -96,37 +99,35 @@ module.exports = function (app) {
   function resolveActivePolarTarget(twsKnots) {
     if (!options.polarData) return;
     try {
-      const vpp = options.polarData;
+      const allowances = options.polarData;
       const isGybeMode = options.maneuverMode === 'gybe';
       
-      let targetArray = isGybeMode ? vpp.vmgDownwind : vpp.vmgUpwind;
-      
-      if (targetArray && Array.isArray(targetArray)) {
-        let match = targetArray.find(item => twsKnots <= (item.tws || item.TWS || 0));
-        if (!match) match = targetArray[targetArray.length - 1];
+      // Map out target column indices matching target Wind Speeds array indices
+      const windSpeeds = allowances.WindSpeeds || [4, 6, 8, 10, 12, 14, 16, 20, 24];
+      let targetIdx = windSpeeds.indexOf(twsKnots);
+      if (targetIdx === -1) targetIdx = 5; // Default index boundary for 14 knots
+
+      if (!isGybeMode) {
+        // Parse Upwind targets using Beat angles and Beat Time-on-Distance array parameters
+        const beatAngles = allowances.BeatAngle || [46, 43, 40.5, 38.8, 37.8, 37.8, 37.4, 37.3, 38.1];
+        const beatSecondsPerMile = allowances.Beat || [1200.2, 855.1, 713.4, 654.3, 631.4, 615.5, 605.5, 595.9, 599.2];
         
-        if (match) {
-          if (isGybeMode) {
-            orcTargetSTW = match.vboat || match.VBoat || match.speed || 8.71;
-            orcTargetAngle = match.downwindAngle || match.angle || match.twa || 152.0;
-          } else {
-            orcTargetSTW = match.vboat || match.VBoat || match.speed || 5.85;
-            orcTargetAngle = match.upwindAngle || match.angle || match.twa || 37.8;
-          }
-          app.debug(`[ORC Polar Update] Live Targets -> STW: ${orcTargetSTW.toFixed(2)} kn | Wind Angle: ${orcTargetAngle.toFixed(1)}°`);
-        }
+        orcTargetAngle = beatAngles[targetIdx] || 37.8;
+        const allowanceValue = beatSecondsPerMile[targetIdx] || 615.5;
+        orcTargetSTW = 3600 / allowanceValue;
       } else {
-        // Safe defaults if arrays aren't matched cleanly
-        if (isGybeMode) {
-          orcTargetSTW = 8.71;   
-          orcTargetAngle = 152.0; 
-        } else {
-          orcTargetSTW = 5.85;   
-          orcTargetAngle = 37.8;  
-        }
+        // Parse Downwind targets using Gybe angles and Run Time-on-Distance array parameters
+        const gybeAngles = allowances.GybeAngle || [139.2, 142.1, 145.6, 148.2, 152.8, 152.0, 150.1, 144.8, 144.4];
+        const runSecondsPerMile = allowances.Run || [1235.2, 850.1, 673.7, 571.0, 510.4, 476.4, 445.2, 371.7, 291.0];
+        
+        orcTargetAngle = gybeAngles[targetIdx] || 152.0;
+        const allowanceValue = runSecondsPerMile[targetIdx] || 476.4;
+        orcTargetSTW = 3600 / allowanceValue;
       }
+      
+      app.debug(`[ORC Matrix Calculations] Locked Targets -> STW: ${orcTargetSTW.toFixed(2)} kn | Wind Angle: ${orcTargetAngle.toFixed(1)}°`);
     } catch (e) {
-      app.error(`Error processing live VPP target properties array: ${e.message}`);
+      app.error(`Error calculating ORC allowance matrix targets: ${e.message}`);
     }
   }
 
@@ -142,13 +143,13 @@ module.exports = function (app) {
     }
 
     let isGybeMode = options.maneuverMode === 'gybe';
-    
     let activeTargetAngle = orcTargetAngle;
     let activeTargetSTW = orcTargetSTW;
-    
+
+    // Safety handling boundaries
     if (isGybeMode && orcTargetAngle < 90) {
       activeTargetAngle = 152.0; 
-      activeTargetSTW = 8.71;
+      activeTargetSTW = 7.55;
     } else if (!isGybeMode && orcTargetAngle > 90) {
       activeTargetAngle = 37.8;  
       activeTargetSTW = 5.85;
@@ -165,7 +166,6 @@ module.exports = function (app) {
     }
 
     let side = isCurrentlyStarboard ? 1 : -1;
-
     let entryAwa = activeTargetAngle * side;  
     let exitAwa = -activeTargetAngle * side; 
     let dynamicOvershootAwa = isGybeMode ? -((activeTargetAngle - 10) * side) : -((activeTargetAngle + 10) * side); 
@@ -286,7 +286,6 @@ module.exports = function (app) {
       lastVerifiedVessel: { 
         type: 'string', 
         title: 'Active Verified Vessel Status', 
-        description: 'Updates automatically when the database sync completes.',
         default: 'None - Waiting for valid API sync...',
         readonly: true 
       },
