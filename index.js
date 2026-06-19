@@ -9,7 +9,7 @@ module.exports = function (app) {
 
   plugin.id = 'signal-k-h5000-simulator';
   plugin.name = 'B&G H5000 Network Simulator (UDP Sentences)';
-  plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificates with live config reload, dynamic wind stepping, and performance scalar integration.';
+  plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificates with exact text matching filters.';
 
   let simStep = 0;
   let isCurrentlyStarboard = true;
@@ -29,7 +29,6 @@ module.exports = function (app) {
   const dampingFactor = 0.033; // ~3-second damping window at 10Hz output
 
   plugin.start = function (startOptions) {
-    // Clear any active intervals if start is triggered during a live configuration save reload
     if (simInterval) {
       clearInterval(simInterval);
       simInterval = null;
@@ -50,7 +49,6 @@ module.exports = function (app) {
     const searchName = options.orcYachtName ? options.orcYachtName.trim() : 'Karukera';
     const searchCountry = options.orcCountryId ? options.orcCountryId.trim() : 'SWE';
 
-    // Instantly sync matrices from registry on save apply without requiring a container restart
     fetchOrcPolarMatrixByName(searchName, searchCountry);
 
     if (options.enableSimulation) {
@@ -72,7 +70,15 @@ module.exports = function (app) {
           let recordArray = data && data.rms ? data.rms : (Array.isArray(data) ? data : []);
 
           if (recordArray.length > 0) {
-            const activeBoatRecord = recordArray[0];
+            // Find an exact case-insensitive match if the server returned multiple boats
+            let activeBoatRecord = recordArray.find(boat => 
+              boat.YachtName && boat.YachtName.trim().toLowerCase() === yachtName.toLowerCase()
+            );
+
+            // Fall back to the first available record if an exact match isn't found
+            if (!activeBoatRecord) {
+              activeBoatRecord = recordArray[0];
+            }
             
             if (activeBoatRecord.Allowances) {
               options.polarData = activeBoatRecord.Allowances;
@@ -90,7 +96,7 @@ module.exports = function (app) {
                 options.lastVerifiedVessel = verifiedVesselName;
                 options.lastVerifiedCert = verifiedCertRef;
                 app.savePluginOptions(options, () => {
-                  app.debug(`[Live Configuration Update] Loaded Matrix: ${verifiedVesselName} | Cert: ${verifiedCertRef}`);
+                  app.debug(`[ORC Match Dynamic Update] Loaded Matrix: ${verifiedVesselName} | Cert: ${verifiedCertRef}`);
                 });
               }
 
@@ -136,22 +142,17 @@ module.exports = function (app) {
   function generateAndBroadcastNMEA() {
     simStep++;
     
-    // Performance Step Scalar Interval processing logic
     let performanceUpdateTicks = (options.perfUpdateInterval || 5) * 10; 
     if (simStep % performanceUpdateTicks === 1 || simStep === 1) {
-      // 1. Shift environment to a new target speed regime out of the parsed matrix array
       let currentIdx = orcWindSpectrum.indexOf(currentTWSRegime);
       let nextIdx = (currentIdx + 1) % orcWindSpectrum.length;
       currentTWSRegime = orcWindSpectrum[nextIdx];
 
-      // 2. Compute randomized variance performance filter target percentage
       let minPerf = (options.minPerformance || 92) / 100;
       let maxPerf = (options.maxPerformance || 98) / 100;
       randomVarianceScalar = minPerf + (Math.random() * (maxPerf - minPerf));
       
-      // 3. Recalculate targets with new wind rules applied
       resolveActivePolarTarget(currentTWSRegime); 
-      app.debug(`[Wind Step Update] Wind Shifted: ${currentTWSRegime} kn | Target Performance Load: ${(randomVarianceScalar * 100).toFixed(1)}%`);
     }
 
     let isGybeMode = options.maneuverMode === 'gybe';
@@ -173,7 +174,6 @@ module.exports = function (app) {
     let currentAWADeg = entryAwa;
     let currentRudderDeg = 0.0;
 
-    // Maneuver Turn Logic Sourced from Live Polar Angle Targets
     if (isGybeMode) {
       if (loopStep >= 0 && loopStep < 30) {
         let progress = loopStep / 30;
@@ -225,7 +225,6 @@ module.exports = function (app) {
       }
     }
 
-    // Apparent Wind Angle Vector Calculations
     let awaRad = (currentAWADeg * Math.PI) / 180;
     let awsKnots = currentTWSRegime; 
     
@@ -233,22 +232,15 @@ module.exports = function (app) {
     let apparentY = awsKnots * Math.sin(awaRad);
     let derivedTWADeg = Math.abs(Math.atan2(apparentY, apparentX) * 180 / Math.PI);
 
-    // Compute unfiltered dynamic VMG
     let twaRad = (derivedTWADeg * Math.PI) / 180;
     let rawVMGKnots = Math.abs(currentSTWKnots * Math.cos(twaRad));
-    
-    // Instrument Damping Filter (Prevents immediate zeroing on tacks)
     filteredVMG = filteredVMG + dampingFactor * (rawVMGKnots - filteredVMG);
 
-    // Assembly
     let vhwSentence = appendChecksum(`IIVHW,,T,,M,${currentSTWKnots.toFixed(2)},N,,K`);
-    
     let awaFormatted = currentAWADeg < 0 ? 360 + currentAWADeg : currentAWADeg;
     let mwvApparentSentence = appendChecksum(`IIMWV,${awaFormatted.toFixed(1)},R,${awsKnots.toFixed(1)},N,A`);
-
     let twaFormatted = currentAWADeg < 0 ? 360 - derivedTWADeg : derivedTWADeg;
     let mwvTrueSentence = appendChecksum(`IIMWV,${twaFormatted.toFixed(1)},T,${currentTWSRegime.toFixed(1)},N,A`);
-    
     let vmgSentence = appendChecksum(`IIVMG,${filteredVMG.toFixed(2)},N,,`);
     let rsaSentence = appendChecksum(`IIRSA,${currentRudderDeg.toFixed(1)},A,,`);
 
@@ -291,7 +283,6 @@ module.exports = function (app) {
       lastVerifiedCert: { 
         type: 'string', 
         title: 'Live Verified Certificate #', 
-        description: 'The real-time reference ID returned by the ORC registry.',
         default: 'None',
         readonly: true 
       },
