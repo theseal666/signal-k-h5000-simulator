@@ -1,44 +1,52 @@
-B&G H5000 Network Simulator & Wind Deriver
-A high-frequency utility plugin for Signal K designed to complement tactical performance systems on the MAT 12.20 racing platform. This plugin serves a dual purpose: it acts as an onboarding mathematical vector deriver for live H5000 instrumentation data, and provides a standalone virtual tacking simulator for software integration testing without requiring real hardware connections.
-📂 Repository File Structure
-Plaintext
+# B&G H5000 Network Simulator (UDP NMEA 0183)
+
+A high-frequency performance testing utility for Signal K designed to mirror physical hardware data pipelines. Instead of injecting values directly into the server's internal memory store, this plugin broadcasts real-time physics data as raw, standard NMEA 0183 sentences over a local network UDP connection.
+
+This ensures that your tactical performance tracking applications process the mock telemetry exactly as they would stream from a physical B&G H5000 CPU network gateway at sea.
+
+---
+
+## 📂 Repository File Structure
+
+```text
 signal-k-h5000-simulator/
-├── index.js          # Core Math Deriver, Vector Physics & Telemetry Generator
-├── package.json      # Signal K Node Server Configuration Meta-data
-└── README.md         # Documentation & Trigonometric System Overview
-🧠 Core Functional Logic
-The plugin operates on a high-frequency 10Hz execution clock loop (every 100ms) executing two core tasks depending on your settings:
-1. Vector Mapping (Live Bridge Mode)
-When running normally on the boat's network, the plugin listens for raw, uncalibrated inputs streaming from the B&G H5000 network processor. It captures:
-Speed Through Water (STW)
-Rudder Angle
-Apparent Wind Angle (AWA)
-Apparent Wind Speed (AWS)
-Because raw instruments can only calculate values relative to the moving boat frame, the plugin uses native coordinate vector transforms to subtract the vessel's forward motion from the apparent wind profile. This isolates the absolute true wind grid and emits clean, derived updates for:
-True Wind Angle (TWA)
-True Wind Speed (TWS)
-Velocity Made Good (VMG)
-2. High-Frequency Maneuver Simulation (Test Mode)
-When enableSimulation is toggled true via the control panel, the plugin detaches from live network sockets and takes control of the local bus. It starts broadcasting automated 30-second tacking performance sequences:
-Phase A (0s to 1.5s): The rudder deflects smoothly up to 8 
-∘
- , tracking the initial turn into the weather couch.
-Phase B (1.5s to 5.0s): The helm hits max apex angle (12 
-∘
- ), passing directly through the wind's eye while simulating sail drag and hull friction velocity drops.
-Phase C (5.0s to 20.0s): Counter-steering sets in to break the turn, dropping the bow to a low exit angle to accelerate out of the speed hole back toward steady-state performance polars.
-Phase D (20.0s to 30.0s): The boat trims back to optimal close-hauled tracks on the new boards before repeating the loop.
-📈 Emitted Signal K Delta Keys
-This plugin calculates, maps, and updates these standard Signal K open data keys at a steady 10Hz stream:
-Delta Path Key	Unit	System Role
-navigation.speedThroughWater	m/s	Longitudinal hull speed metric
-steering.rudderAngle	rad	Deflection variance of helm foil
-environment.wind.angleApparent	rad	Measured raw wind direction angle
-environment.wind.speedApparent	m/s	Measured raw wind speed velocity
-environment.wind.angleTrueWater	rad	Derived: Velocity vector true wind angle
-environment.wind.speedTrue	m/s	Derived: Velocity vector true wind strength
-navigation.velocityMadeGood	m/s	Derived: Calculated upwind efficiency progress
-⚙️ Configuration Dashboard Settings
-Adjust these controls directly inside your Signal K Server -> Plugin Configuration web dashboard:
-Enable Virtual Tacking Simulator: Toggling this checkbox instantly overrides active NMEA network wires and streams clean, artificial tacking curves for debugging and dashboard calibration (Default: false).
-Simulation Base Speed (Knots): Sets the unhampered, steady-state upwind hull speed velocity baseline matching your MAT 12.20 VPP tables (Default: 7.80 kn).
+├── index.js          # UDP NMEA 0183 Physics & Broadcast Engine
+├── package.json      # Signal K Node Server Plugin Manifest
+└── README.md         # Documentation & Ingestion Setup Guide
+
+
+
+
+Core Functional Logic
+The plugin operates on a 10Hz clock execution loop (every 100ms) to model real-world instrument update cycles:
+1. High-Frequency Maneuver Simulation
+When enabled, the plugin computes dynamic boat physics across four operational phases:
+Phase 1 (Helm Entry): The rudder deflects smoothly up to 8 degrees (or -10 degrees downwind), sweeping the vessel into the maneuver.
+Phase 2 (Apex Cross): The boat passes through the wind's eye (tacking) or downwind gybe dead-zone. Apparent wind angles shift, and velocity drops dynamically due to simulated sail drag and hull friction.
+Phase 3 (Acceleration Build): Counter-steering sets in to hold the new course while the boat builds momentum and accelerates back toward target performance speeds.
+Phase 4 (Steady-State Line): The boat locks onto its target baseline upwind or downwind tracking angle until the loop resets.
+2. Random Performance Variance Range
+To simulate real-world conditions (seastate, helm steering error, or changing wind velocity), the simulator scales its target speeds and angles using a random efficiency scalar mapped dynamically between your configured minPerformance and maxPerformance thresholds on every loop cycle.
+3. Native Network Packaging
+The computed physics attributes are packaged directly into standard marine sentences:
+$IIVHW: Speed Through Water (STW) and Heading attributes.
+$IIMWV: Relative/Apparent Wind Angle (AWA) and Apparent Wind Speed (AWS).
+These sentences are given valid standard NMEA checksum signatures and blasted directly out of the container to local host UDP port 2222.
+📈 Emitted Telemetry Data
+NMEA Sentence	Captured Variable Mapping	Target Signal K Target Keys
+$IIVHW	Speed Through Water	navigation.speedThroughWater
+$IIMWV	Apparent Wind Angle	environment.wind.angleApparent
+$IIMWV	Apparent Wind Speed	environment.wind.speedApparent
+(Note: Signal K's core ingestion system will automatically derive True Wind Angle, True Wind Speed, and Upwind/Downwind Velocity Made Good vectors from these raw inputs).
+⚙️ Connection Ingestion Setup
+To channel this data into your tactical environment, you must register it as a standard network line in your Signal K administration dashboard:
+Log into your Signal K Web Console.
+Navigate to Server -> Data Connections inside the sidebar.
+Click the Add Connection button and assign these parameters:
+Data Connection ID: h5000-simulator-feed
+Connection Type: NMEA 0183
+NMEA 0183 Source: UDP
+Port: 2222
+Validate Checksums: True / Checked
+Click Apply Changes and restart your Signal K server.
+Once configured, toggle Enable Simulator Output Feed in this plugin's settings to start streaming. To switch back to using the boat's physical network instruments, simply turn this plugin's simulator switch to off.
