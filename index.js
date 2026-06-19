@@ -8,19 +8,28 @@ module.exports = function (app) {
 
   plugin.id = 'signal-k-h5000-simulator';
   plugin.name = 'B&G H5000 Network Simulator (UDP Sentences)';
-  plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificate VPP matrices including derived VMG, TWA, and TWS calculations.';
+  plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificates with live config reload, dynamic wind stepping, and performance scalar integration.';
 
   let simStep = 0;
   let isCurrentlyStarboard = true;
   let verifiedVesselName = 'None - Waiting for valid API sync...';
   let verifiedCertRef = 'None';
 
-  // Active runtime targets (will overwrite dynamically upon API load)
+  // Active Environmental & Performance states
+  let currentTWSRegime = 14.0;
+  const orcWindSpectrum = [4, 6, 8, 10, 12, 14, 16, 20, 24];
+  
   let orcTargetSTW = 5.85;   
   let orcTargetAngle = 37.8; 
   let randomVarianceScalar = 0.95; 
 
   plugin.start = function (startOptions) {
+    // Clear any active intervals if start is triggered during a live configuration save reload
+    if (simInterval) {
+      clearInterval(simInterval);
+      simInterval = null;
+    }
+
     options = startOptions || {};
     isCurrentlyStarboard = true;
 
@@ -36,6 +45,7 @@ module.exports = function (app) {
     const searchName = options.orcYachtName ? options.orcYachtName.trim() : 'Karukera';
     const searchCountry = options.orcCountryId ? options.orcCountryId.trim() : 'SWE';
 
+    // Instantly sync matrices from registry on save apply
     fetchOrcPolarMatrixByName(searchName, searchCountry);
 
     if (options.enableSimulation) {
@@ -78,11 +88,11 @@ module.exports = function (app) {
             options.lastVerifiedVessel = verifiedVesselName;
             options.lastVerifiedCert = verifiedCertRef;
             app.savePluginOptions(options, () => {
-              app.debug(`[ORC Sync Verified] Matrix Lock: ${verifiedVesselName} | Cert Token: ${verifiedCertRef}`);
+              app.debug(`[Live Configuration Update] Loaded Matrix: ${verifiedVesselName} | Cert: ${verifiedCertRef}`);
             });
           }
 
-          resolveActivePolarTarget(14.0); 
+          resolveActivePolarTarget(currentTWSRegime); 
         } else {
           app.error(`Matched record structure, but Allowances data map was absent.`);
         }
@@ -100,9 +110,13 @@ module.exports = function (app) {
       const allowances = options.polarData;
       const isGybeMode = options.maneuverMode === 'gybe';
       
-      const windSpeeds = allowances.WindSpeeds || [4, 6, 8, 10, 12, 14, 16, 20, 24];
+      const windSpeeds = allowances.WindSpeeds || orcWindSpectrum;
       let targetIdx = windSpeeds.indexOf(twsKnots);
-      if (targetIdx === -1) targetIdx = 5; 
+      if (targetIdx === -1) {
+        // Fallback to nearest index match logic if wind isn't precisely sitting on an array boundary
+        targetIdx = windSpeeds.reduce((prev, curr, idx) => 
+          Math.abs(curr - twsKnots) < Math.abs(windSpeeds[prev] - twsKnots) ? idx : prev, 0);
+      } 
 
       if (!isGybeMode) {
         const beatAngles = allowances.BeatAngle || [46, 43, 40.5, 38.8, 37.8, 37.8, 37.4, 37.3, 38.1];
@@ -119,8 +133,6 @@ module.exports = function (app) {
         const allowanceValue = runSecondsPerMile[targetIdx] || 476.4;
         orcTargetSTW = 3600 / allowanceValue;
       }
-      
-      app.debug(`[ORC Matrix Calculations] Locked Targets -> STW: ${orcTargetSTW.toFixed(2)} kn | Wind Angle: ${orcTargetAngle.toFixed(1)}°`);
     } catch (e) {
       app.error(`Error calculating ORC allowance matrix targets: ${e.message}`);
     }
@@ -129,30 +141,30 @@ module.exports = function (app) {
   function generateAndBroadcastNMEA() {
     simStep++;
     
+    // Performance Step Scalar Interval processing logic
     let performanceUpdateTicks = (options.perfUpdateInterval || 5) * 10; 
     if (simStep % performanceUpdateTicks === 1 || simStep === 1) {
+      // 1. Shift environment to a new target speed regime out of the parsed matrix array
+      let currentIdx = orcWindSpectrum.indexOf(currentTWSRegime);
+      let nextIdx = (currentIdx + 1) % orcWindSpectrum.length;
+      currentTWSRegime = orcWindSpectrum[nextIdx];
+
+      // 2. Compute randomized variance performance filter target percentage
       let minPerf = (options.minPerformance || 92) / 100;
       let maxPerf = (options.maxPerformance || 98) / 100;
       randomVarianceScalar = minPerf + (Math.random() * (maxPerf - minPerf));
-      resolveActivePolarTarget(14.0); 
+      
+      // 3. Recalculate speeds with new wind rules applied
+      resolveActivePolarTarget(currentTWSRegime); 
+      app.debug(`[Environmental Update Step] Wind Shifted: ${currentTWSRegime} kn | Target Performance Load: ${(randomVarianceScalar * 100).toFixed(1)}%`);
     }
 
     let isGybeMode = options.maneuverMode === 'gybe';
     let activeTargetAngle = orcTargetAngle;
     let activeTargetSTW = orcTargetSTW;
 
-    if (isGybeMode && orcTargetAngle < 90) {
-      activeTargetAngle = 152.0; 
-      activeTargetSTW = 7.55;
-    } else if (!isGybeMode && orcTargetAngle > 90) {
-      activeTargetAngle = 37.8;  
-      activeTargetSTW = 5.85;
-    }
-
     let baseSTWKnots = activeTargetSTW * randomVarianceScalar;
-    
-    // Derived Environmental Inputs (TWS & TWA Tracking Parameters)
-    let simulatedTWSKnots = 14.0; 
+    let simulatedTWSKnots = currentTWSRegime; 
     let simulatedTWADeg = activeTargetAngle; 
 
     let totalLoopTicks = (options.maneuverInterval || 45) * 10;
@@ -209,8 +221,6 @@ module.exports = function (app) {
         currentAWADeg = exitAwa;
         currentSTWKnots = baseSTWKnots;
       }
-      
-      // Compute tracking dynamic true wind angle shift based on current orientation mapping
       simulatedTWADeg = Math.abs(currentAWADeg);
     } else {
       if (loopStep >= 0 && loopStep < 30) {
@@ -238,16 +248,12 @@ module.exports = function (app) {
         currentAWADeg = exitAwa;
         currentSTWKnots = baseSTWKnots;
       }
-      
       simulatedTWADeg = Math.abs(currentAWADeg);
     }
 
-    // 1. Math formula calculation for derived Velocity Made Good (VMG)
-    // VMG = BoatSpeed * cos(True Wind Angle converted to radians)
     let twaRadians = (simulatedTWADeg * Math.PI) / 180;
     let computedVMGKnots = Math.abs(currentSTWKnots * Math.cos(twaRadians));
 
-    // 2. Generate standard raw performance sentences
     let vhw = `IIVHW,,T,,M,${currentSTWKnots.toFixed(2)},N,,K`;
     let vhwSentence = appendChecksum(vhw);
 
@@ -259,7 +265,6 @@ module.exports = function (app) {
     let rsa = `IIRSA,${rudderStr},A,,`;
     let rsaSentence = appendChecksum(rsa);
 
-    // 3. Generate Derived H5000 Data Sentences (TWA, TWS, and VMG)
     let twaFormatted = currentAWADeg < 0 ? 360 - simulatedTWADeg : simulatedTWADeg;
     let mwvTrue = `IIMWV,${twaFormatted.toFixed(1)},T,${simulatedTWSKnots.toFixed(1)},N,A`;
     let mwvTrueSentence = appendChecksum(mwvTrue);
@@ -267,7 +272,6 @@ module.exports = function (app) {
     let vmgSentenceText = `IIVMG,${computedVMGKnots.toFixed(2)},N,,`;
     let vmgSentence = appendChecksum(vmgSentenceText);
 
-    // Combine payload and push out to UDP
     const payload = `${vhwSentence}\r\n${mwvApparentSentence}\r\n${mwvTrueSentence}\r\n${vmgSentence}\r\n${rsaSentence}\r\n`;
     udpClient.send(payload, 2222, '127.0.0.1');
   }
