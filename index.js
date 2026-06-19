@@ -1,5 +1,6 @@
 const dgram = require('dgram');
 const https = require('https');
+const path = require('path');
 
 module.exports = function (app) {
   const plugin = {};
@@ -7,16 +8,16 @@ module.exports = function (app) {
   let options = {};
   const udpClient = dgram.createSocket('udp4');
 
+  // Core Identity (Must match your folder name exactly to show up in configuration list)
   plugin.id = 'signal-k-h5000-simulator';
-  plugin.name = 'B&G H5000 Network Simulator (UDP Sentences)';
-  plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificates with live config reload, dynamic wind stepping, performance scalar updates, and webapp stream integrations.';
+  plugin.name = 'B&G H5000 Network Simulator';
+  plugin.description = 'Broadcasts high-frequency simulated NMEA 0183 sentences over UDP port 2222 by dynamically parsing live ORC database certificates.';
 
   let simStep = 0;
   let isCurrentlyStarboard = true;
   let verifiedVesselName = 'None - Waiting for valid API sync...';
   let verifiedCertRef = 'None';
 
-  // Environmental Tracking & Target Matrices
   let currentTWSRegime = 14.0;
   const orcWindSpectrum = [4, 6, 8, 10, 12, 14, 16, 20, 24];
   
@@ -24,9 +25,15 @@ module.exports = function (app) {
   let orcTargetAngle = 37.8; 
   let randomVarianceScalar = 0.95; 
 
-  // Damping States to mimic B&G H5000 processing delays
   let filteredVMG = 0.0;
-  const dampingFactor = 0.033; // ~3-second damping window at 10Hz output
+  const dampingFactor = 0.033;
+
+  // Signal K standard webapp/API route registration hook
+  plugin.signalKApiRoutes = function (router) {
+    const express = require('express');
+    router.use('/', express.static(path.join(__dirname, 'public')));
+    return router;
+  };
 
   plugin.start = function (startOptions) {
     if (simInterval) {
@@ -37,16 +44,8 @@ module.exports = function (app) {
     options = startOptions || {};
     isCurrentlyStarboard = true;
 
-    if (options.lastVerifiedVessel) {
-      verifiedVesselName = options.lastVerifiedVessel;
-      plugin.schema.properties.lastVerifiedVessel.default = verifiedVesselName;
-    }
-    if (options.lastVerifiedCert) {
-      verifiedCertRef = options.lastVerifiedCert;
-      plugin.schema.properties.lastVerifiedCert.default = verifiedCertRef;
-    }
-
-    const searchName = options.orcYachtName ? options.orcYachtName.trim() : 'Karukera';
+    // Use current form configurations or defaults
+    const searchName = options.orcYachtName ? options.orcYachtName.trim() : 'Oxygen';
     const searchCountry = options.orcCountryId ? options.orcCountryId.trim() : 'SWE';
 
     fetchOrcPolarMatrixByName(searchName, searchCountry);
@@ -85,31 +84,18 @@ module.exports = function (app) {
               const sailNum = activeBoatRecord.SailNo || '';
               
               verifiedVesselName = sailNum ? `${craftName} (${sailNum})` : craftName;
-              plugin.schema.properties.lastVerifiedVessel.default = verifiedVesselName;
-              
               verifiedCertRef = activeBoatRecord.RefNo || 'Found';
-              plugin.schema.properties.lastVerifiedCert.default = verifiedCertRef;
               
-              if (options.lastVerifiedVessel !== verifiedVesselName || options.lastVerifiedCert !== verifiedCertRef) {
-                options.lastVerifiedVessel = verifiedVesselName;
-                options.lastVerifiedCert = verifiedCertRef;
-                app.savePluginOptions(options, () => {
-                  app.debug(`[ORC Match Dynamic Update] Loaded Matrix: ${verifiedVesselName} | Cert: ${verifiedCertRef}`);
-                });
-              }
-
               resolveActivePolarTarget(currentTWSRegime); 
-            } else {
-              app.error(`Matched record structure, but Allowances data map was absent.`);
             }
-          } else {
-            app.error(`No active certification criteria matched on the database server for: ${yachtName} (${countryId})`);
           }
         } catch (e) {
-          app.error(`Failed parsing target polar data from registry: ${e.message}`);
+          if (app.error) app.error(`VVP parsing exception: ${e.message}`);
         }
       });
-    }).on('error', (err) => app.error(`Simulator live ORC network synchronization failed: ${err.message}`));
+    }).on('error', (err) => {
+      if (app.error) app.error(`Network sync failed: ${err.message}`);
+    });
   }
 
   function resolveActivePolarTarget(twsKnots) {
@@ -140,7 +126,7 @@ module.exports = function (app) {
   function generateAndBroadcastNMEA() {
     simStep++;
     
-    let performanceUpdateTicks = (options.perfUpdateInterval || 5) * 10; 
+    let performanceUpdateTicks = (options.perfUpdateInterval || 300) * 10; 
     if (simStep % performanceUpdateTicks === 1 || simStep === 1) {
       let currentIdx = orcWindSpectrum.indexOf(currentTWSRegime);
       let nextIdx = (currentIdx + 1) % orcWindSpectrum.length;
@@ -274,30 +260,17 @@ module.exports = function (app) {
     type: 'object',
     title: 'H5000 Network UDP Simulator Controls',
     properties: {
-      enableSimulation: { type: 'boolean', title: 'Enable Simulator Output Feed', default: false },
+      enableSimulation: { type: 'boolean', title: 'Enable Simulator Output Feed', default: true },
       maneuverMode: { 
         type: 'string', 
         title: 'Maneuver Simulation Track Target', 
         default: 'tack',
-        enum: ['tack', 'gybe'],
-        enumNames: ['Tacking (Upwind Testing Sequence)', 'Gybing (Downwind Testing Sequence)']
+        enum: ['tack', 'gybe']
       },
       maneuverInterval: { type: 'number', title: 'Maneuver Interval Cycles (Seconds)', default: 45 },
-      perfUpdateInterval: { type: 'number', title: 'Performance Scalar Step Changes (Seconds)', default: 5 },
-      orcYachtName: { type: 'string', title: 'ORC Yacht Name Lookup Field', default: 'Karukera' },
+      perfUpdateInterval: { type: 'number', title: 'Performance Scalar Step Changes (Seconds)', default: 300 },
+      orcYachtName: { type: 'string', title: 'ORC Yacht Name Lookup Field', default: 'Oxygen' },
       orcCountryId: { type: 'string', title: 'ORC Country Prefix Code', default: 'SWE' },
-      lastVerifiedVessel: { 
-        type: 'string', 
-        title: 'Active Verified Vessel Status', 
-        default: 'None - Waiting for valid API sync...',
-        readonly: true 
-      },
-      lastVerifiedCert: { 
-        type: 'string', 
-        title: 'Live Verified Certificate #', 
-        default: 'None',
-        readonly: true 
-      },
       minPerformance: { type: 'number', title: 'Minimum Target Performance Filter Range (%)', default: 92 },
       maxPerformance: { type: 'number', title: 'Maximum Target Performance Filter Range (%)', default: 98 }
     }
