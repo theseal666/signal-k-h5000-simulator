@@ -1,14 +1,26 @@
 {
   "name": "signal-k-h5000-simulator",
   "version": "1.0.0",
-  "description": "B&G H5000 Network Simulator",
+  "description": "B&G H5000 simulator and derived wind vector math processor for Signal K",
   "main": "index.js",
   "keywords": [
-    "signalk-node-plugin"
+    "signalk-node-server-plugin",
+    "signalk-plugin"
   ],
   "signalk": {
-    "type": "plugin",
-    "displayName": "B&G H5000 Network Simulator"
+    "pluginid": "signal-k-h5000-simulator",
+    "supportedPaths": [
+      "navigation.speedThroughWater",
+      "steering.rudderAngle",
+      "environment.wind.angleApparent",
+      "environment.wind.speedApparent",
+      "environment.wind.angleTrueWater",
+      "environment.wind.speedTrue",
+      "navigation.velocityMadeGood"
+    ],
+    "webapp": "public"
   },
+  "author": "",
+  "license": "ISC",
   "dependencies": {}
 }
